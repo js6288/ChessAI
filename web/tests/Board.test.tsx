@@ -8,6 +8,13 @@ const pieces: Piece[] = [
   { square: "e9", piece: "k", kind: "K", color: "black", glyph: "将" },
 ];
 
+const ongoing = {
+  status: "ongoing" as const,
+  winner: null,
+  reason: null,
+  terminal: false,
+};
+
 describe("Board", () => {
   it("renders accessible pieces and reports square activation", () => {
     const onSquare = vi.fn();
@@ -19,8 +26,10 @@ describe("Board", () => {
         selected={null}
         flipped={false}
         interactiveColor="red"
+        outcome={ongoing}
         onSquare={onSquare}
         onMove={vi.fn()}
+        onRestart={vi.fn()}
       />,
     );
 
@@ -39,8 +48,10 @@ describe("Board", () => {
         selected="h2"
         flipped
         interactiveColor="red"
+        outcome={ongoing}
         onSquare={onSquare}
         onMove={vi.fn()}
+        onRestart={vi.fn()}
       />,
     );
 
@@ -60,8 +71,10 @@ describe("Board", () => {
         selected={null}
         flipped={false}
         interactiveColor="red"
+        outcome={ongoing}
         onSquare={vi.fn()}
         onMove={onMove}
+        onRestart={vi.fn()}
       />,
     );
 
@@ -79,5 +92,34 @@ describe("Board", () => {
     fireEvent.pointerUp(screen.getByTestId("square-e2"), { pointerId: 1 });
     expect(onMove).toHaveBeenCalledOnce();
     expect(onMove).toHaveBeenCalledWith("h2e2");
+  });
+
+  it("presents a readable animated settlement and lets the player review the board", () => {
+    const onRestart = vi.fn();
+    render(
+      <Board
+        pieces={pieces}
+        legalMoves={[]}
+        lastMove="h2e2"
+        selected={null}
+        flipped={false}
+        interactiveColor="red"
+        disabled
+        outcome={{ status: "red_win", winner: "red", reason: "checkmate", terminal: true }}
+        onSquare={vi.fn()}
+        onMove={vi.fn()}
+        onRestart={onRestart}
+      />,
+    );
+
+    expect(screen.getByRole("dialog", { name: "红方胜" })).toBeInTheDocument();
+    expect(screen.getByText("将死")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "查看棋盘" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看结算 · 红方胜" }));
+    fireEvent.click(screen.getByRole("button", { name: "再开一局" }));
+
+    expect(onRestart).toHaveBeenCalledOnce();
   });
 });

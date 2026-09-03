@@ -13,6 +13,7 @@ import {
   playMove,
   restartGame,
 } from "./lib/api";
+import { outcomeReasonLabel, outcomeTitle } from "./lib/outcome";
 import type { Difficulty, GameState, HumanSide, ModelDescriptor } from "./types/api";
 
 function errorMessage(error: unknown): string {
@@ -22,10 +23,12 @@ function errorMessage(error: unknown): string {
 function statusCopy(game: GameState | null): { title: string; detail: string; tone: string } {
   if (!game) return { title: "正在备枰", detail: "连接本地推理服务", tone: "quiet" };
   if (game.outcome.terminal) {
-    if (game.outcome.status === "draw") return { title: "和棋", detail: game.outcome.reason ?? "规则裁决", tone: "draw" };
+    if (game.outcome.status === "draw") {
+      return { title: outcomeTitle(game.outcome), detail: outcomeReasonLabel(game.outcome), tone: "draw" };
+    }
     return {
-      title: `${game.outcome.winner === "red" ? "红方" : "黑方"}胜`,
-      detail: game.outcome.reason === "resignation" ? "一方认输" : game.outcome.reason ?? "终局",
+      title: outcomeTitle(game.outcome),
+      detail: outcomeReasonLabel(game.outcome, "终局"),
       tone: game.outcome.winner ?? "quiet",
     };
   }
@@ -266,8 +269,10 @@ export default function App() {
                   interactiveColor={game.human_side}
                   disabled={boardDisabled}
                   inCheck={game.in_check}
+                  outcome={game.outcome}
                   onSquare={handleSquare}
                   onMove={(move) => void submitMove(move)}
+                  onRestart={() => void runRestart()}
                 />
               ) : (
                 <div className="board-loading"><span>弈</span><p>正在展开棋盘…</p></div>

@@ -1,5 +1,6 @@
-import { useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
-import type { Color, Piece } from "../types/api";
+import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
+import { outcomeReasonLabel, outcomeTitle } from "../lib/outcome";
+import type { Color, Outcome, Piece } from "../types/api";
 
 const FILES = "abcdefghi";
 const RANKS = Array.from({ length: 10 }, (_, index) => index);
@@ -16,8 +17,10 @@ interface BoardProps {
   interactiveColor: Color;
   disabled?: boolean;
   inCheck?: boolean;
+  outcome: Outcome;
   onSquare: (square: string) => void;
   onMove: (move: string) => void;
+  onRestart: () => void;
 }
 
 function coordinates(square: string, flipped: boolean): { x: number; y: number } {
@@ -47,11 +50,22 @@ export function Board({
   interactiveColor,
   disabled = false,
   inCheck = false,
+  outcome,
   onSquare,
   onMove,
+  onRestart,
 }: BoardProps) {
   const [dragFrom, setDragFrom] = useState<string | null>(null);
+  const [resultDismissed, setResultDismissed] = useState(false);
   const movedByDrag = useRef(false);
+  const resultVisible = outcome.terminal && !resultDismissed;
+  const resultTone = outcome.status === "draw" ? "draw" : outcome.winner ?? "draw";
+  const resultTitle = outcomeTitle(outcome);
+  const resultReason = outcomeReasonLabel(outcome, "终局");
+
+  useEffect(() => {
+    if (!outcome.terminal) setResultDismissed(false);
+  }, [outcome.terminal]);
   const legalDestinations = new Set(
     selected ? legalMoves.filter((move) => move.startsWith(selected)).map((move) => move.slice(2)) : [],
   );
@@ -88,7 +102,10 @@ export function Board({
   };
 
   return (
-    <div className="board-shell" data-flipped={flipped}>
+    <div
+      className={`board-shell${outcome.terminal ? ` has-result result-${resultTone}` : ""}`}
+      data-flipped={flipped}
+    >
       <div className="board-caption" aria-live="polite">
         <span>{flipped ? "黑方视角" : "红方视角"}</span>
         <span className="board-caption-rule" />
@@ -227,6 +244,39 @@ export function Board({
           })}
         </g>
       </svg>
+
+      {resultVisible ? (
+        <div
+          className={`game-result-layer result-${resultTone}`}
+          role="dialog"
+          aria-labelledby="game-result-title"
+          aria-describedby="game-result-reason"
+          aria-live="assertive"
+        >
+          <div className="game-result-card">
+            <span className="game-result-kicker">终局裁定 · GAME SETTLED</span>
+            <span className="game-result-seal" aria-hidden="true">
+              {outcome.status === "draw" ? "和" : "勝"}
+            </span>
+            <span className="game-result-rule" aria-hidden="true"><i /><b>终</b><i /></span>
+            <h2 id="game-result-title">{resultTitle}</h2>
+            <p id="game-result-reason">{resultReason}</p>
+            <div className="game-result-actions">
+              <button type="button" className="result-primary" onClick={onRestart}>再开一局</button>
+              <button type="button" className="result-secondary" onClick={() => setResultDismissed(true)}>查看棋盘</button>
+            </div>
+          </div>
+        </div>
+      ) : outcome.terminal ? (
+        <button
+          type="button"
+          className={`game-result-reopen result-${resultTone}`}
+          onClick={() => setResultDismissed(false)}
+        >
+          <span aria-hidden="true">终</span>
+          查看结算 · {resultTitle}
+        </button>
+      ) : null}
     </div>
   );
 }
