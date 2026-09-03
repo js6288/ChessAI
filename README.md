@@ -62,6 +62,10 @@ chessai train playable data/processed/ccpd \
 状态清单、数据、replay 和 checkpoint 都会重新校验 SHA-256。未传
 `--resume` 时，非空输出目录会被拒绝，防止覆盖既有结果。正式训练前可先跑：
 
+旧版训练若已经完成第 1 轮并进入第 2 轮 self-play，可在 `--resume` 的同时仅使用
+一次 `--restart-from-first-selfplay`：程序会归档全部旧 RL 轮次和旧模型、恢复
+监督预热 checkpoint，并从新第 1 轮开始，不需要手工修改状态文件。
+
 ```bash
 chessai train playable data/processed/ccpd \
   --output runs/playable-tiny \

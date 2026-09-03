@@ -169,6 +169,15 @@ def train_playable(
             help="Archive and restart only the current uncommitted self-play iteration"
         ),
     ] = False,
+    restart_from_first_selfplay: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Archive every committed/current RL iteration, restore bootstrap-best, "
+                "and restart at iteration one"
+            )
+        ),
+    ] = False,
     tiny: Annotated[bool, typer.Option(help="Run the complete bounded CPU pipeline")] = False,
 ) -> None:
     cfg = PlayableConfig.tiny() if tiny else playable_config_from_mapping(_load_yaml(config))
@@ -180,6 +189,7 @@ def train_playable(
             config=cfg,
             resume=resume,
             restart_current_selfplay=restart_current_selfplay,
+            restart_from_first_selfplay=restart_from_first_selfplay,
         )
     )
 

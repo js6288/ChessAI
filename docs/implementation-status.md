@@ -11,7 +11,7 @@
 | 数据 | 固定 CCPD 来源、许可、解码、合法重放、去重和整盘切分 | 53,685 条输入；27,667 盘去重接受；573 拒绝；全部 SHA-256 复验通过 | 无必需数据项 |
 | 一键训练 | 1 epoch 监督预热、3 × 50K 自博弈、300K replay、20 盘快速评测、best/rollback | 真实 CCPD manifest 上的 CPU tiny 完整闭环和完成后恢复通过 | 正式至少 150,000 个 RL 局面 |
 | Self-play 性能 | 48 个 spawn actor、共享内存请求槽、单 GPU 动态批推理、滚动调度、压缩 IPC、`runtime.json` | 进程 tiny、批推理、seed/shard 连续与异常保留测试 | RTX 5090 上 5,000 局面 pilot；相对旧基线至少 5 倍才继续 |
-| 恢复与留存 | `playable-run-v2`、v1 备份迁移、原子状态、当前轮归档重启、散列复验、安全清理 | 篡改/缺失、v1 迁移、非空输出、候选接受/拒绝、轮换和越界删除测试通过 | 云端中断恢复演练 |
+| 恢复与留存 | `playable-run-v2`、v1 备份迁移、原子状态、当前轮或全部 RL 轮次归档重启、bootstrap 恢复、散列复验、安全清理 | 篡改/缺失、v1 迁移、从 bootstrap 重启、候选接受/拒绝、轮换和越界删除测试通过 | 云端中断恢复演练 |
 | 服务 | REST/WebSocket、expected-ply、防过期提交、可取消 AI 搜索、精简模型响应 | API 测试通过；已删除的 `/api/v1/runs` 返回 404 | 长时多会话稳定性 |
 | GUI | 单一对弈页、SVG 棋盘、择边/难度/模型、FEN/PGN、AI 分析 | 3 个组件测试、生产构建、桌面/窄屏 4 个 Playwright 场景通过 | 使用正式 best 完成整盘人工验收 |
 | 云端门禁 | 12 vCPU、32 GB RAM、25 GB 磁盘、24 GB VRAM、BF16、`sm_120`、native | 本地 doctor 正确判定只适合 smoke；云端配置书面满足资源门槛 | 在实际 RTX 5090 上运行 doctor 与 tiny |
@@ -22,7 +22,7 @@
 不是棋力结论。
 
 2026-09-03 本地验证快照：Ruff 格式/检查通过，Mypy 对 36 个源文件通过，
-70 个 Python 测试通过，native 另由 Linux CI 执行 10,000 个随机局面差分；前端 3 个组件
+71 个 Python 测试通过，native 另由 Linux CI 执行 10,000 个随机局面差分；前端 3 个组件
 测试、TypeScript、Vite 构建及桌面/窄屏 4 个 Playwright 场景通过；sdist 和 wheel
 构建通过；真实处理后 CCPD 上的 `train playable --tiny` 及 `--resume` 通过。
 

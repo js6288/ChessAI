@@ -62,7 +62,10 @@ checkpoint 与 `playable-run-v2` 状态完成原子提交后，才会在当前�
 窗口外的旧 replay。状态记录阶段、轮次、种子、局面计数、每个 replay manifest、
 快速评测、运行时参数历史和权重散列。恢复时重新验证所有引用，不覆盖既有 shard。
 旧 v1 运行可在保留 bootstrap/best 的前提下迁移；一次性的
-`--restart-current-selfplay` 只归档并重跑尚未提交的当前 self-play。
+`--restart-current-selfplay` 只归档并重跑尚未提交的当前 self-play。如果旧训练已
+完成至少一轮并进入下一轮 self-play，`--restart-from-first-selfplay` 会先归档全部
+旧 RL 轮次和当时的 best/rollback，再从不可变的 `bootstrap/bootstrap-best` 恢复并
+重新开始第 1 轮；两个入口都不直接删除旧产物。
 
 ## 服务并发
 

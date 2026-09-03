@@ -392,6 +392,102 @@ def _archive_current_selfplay(state: dict[str, Any], output: Path) -> dict[str, 
     return record
 
 
+def _restart_from_first_selfplay(
+    state: dict[str, Any], output: Path, model_dir: Path
+) -> dict[str, Any]:
+    """Archive every RL iteration and restore the immutable bootstrap checkpoint."""
+
+    if state.get("stage") != "selfplay" or int(state.get("iteration", 0)) < 1:
+        raise ValueError(
+            "--restart-from-first-selfplay requires a completed RL iteration and the "
+            "next selfplay stage"
+        )
+    if state.get("candidate_checkpoint") is not None:
+        raise ValueError("cannot restart from bootstrap while a candidate checkpoint is active")
+    if state.get("restart_from_first_selfplay_used"):
+        raise ValueError("--restart-from-first-selfplay was already used for this run")
+
+    bootstrap = output / "bootstrap" / "bootstrap-best"
+    bootstrap_record = _checkpoint_record(bootstrap)
+    iteration_dirs = sorted(
+        path
+        for path in output.glob("iteration-*")
+        if (
+            path.is_dir()
+            and path.parent.resolve() == output.resolve()
+            and path.name.startswith("iteration-")
+            and len(path.name.removeprefix("iteration-")) == 3
+            and path.name.removeprefix("iteration-").isdigit()
+        )
+    )
+    if not iteration_dirs:
+        raise FileNotFoundError("no RL iteration directories are available to archive")
+
+    abandoned = output / "abandoned"
+    abandoned.mkdir(parents=True, exist_ok=True)
+    suffix = 1
+    destination = abandoned / f"restart-from-first-selfplay-{suffix:02d}"
+    while destination.exists():
+        suffix += 1
+        destination = abandoned / f"restart-from-first-selfplay-{suffix:02d}"
+    destination.mkdir()
+
+    # Keep a complete, independently readable record before changing either the
+    # iteration tree or the model pointers. Model copies are intentionally kept
+    # because a previously accepted RL checkpoint may otherwise be rotated away.
+    write_json_atomic(destination / "state-before-restart.json", state)
+    archived_models = destination / "models"
+    model_records: dict[str, dict[str, str]] = {}
+    for name in ("best", "rollback"):
+        source = model_dir / name
+        if not source.is_dir():
+            continue
+        target = archived_models / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, target)
+        model_records[name] = _checkpoint_record(target)
+
+    moved_iterations: list[str] = []
+    for source in iteration_dirs:
+        target = destination / source.name
+        os.replace(source, target)
+        moved_iterations.append(str(target))
+
+    best, _ = _install_best(bootstrap, model_dir)
+    rollback = model_dir / "rollback"
+    if rollback.is_dir():
+        _safe_remove_tree(rollback, model_dir)
+
+    record = {
+        "path": str(destination),
+        "previous_iteration": int(state["iteration"]),
+        "previous_rl_generated_positions": int(state["rl_generated_positions"]),
+        "previous_active_checkpoint": state.get("active_checkpoint"),
+        "archived_models": model_records,
+        "archived_iteration_directories": moved_iterations,
+        "bootstrap_checkpoint": bootstrap_record,
+    }
+    cast(list[dict[str, Any]], state.setdefault("rl_restarts", [])).append(record)
+    state.update(
+        {
+            "stage": "selfplay",
+            "iteration": 0,
+            "rl_generated_positions": 0,
+            "active_checkpoint": best,
+            "rollback_checkpoint": None,
+            "candidate_checkpoint": None,
+            "replay_iterations": [],
+            "evaluations": [],
+            "completed_steps": ["bootstrap"],
+            "playable_gate_passed": None,
+            "restart_current_selfplay_used": False,
+            "restart_from_first_selfplay_used": True,
+        }
+    )
+    state.pop("final_evaluation", None)
+    return record
+
+
 def run_playable_training(
     data_dir: str | Path,
     output_dir: str | Path,
@@ -400,6 +496,7 @@ def run_playable_training(
     config: PlayableConfig | None = None,
     resume: bool = False,
     restart_current_selfplay: bool = False,
+    restart_from_first_selfplay: bool = False,
 ) -> dict[str, Any]:
     cfg = config or PlayableConfig()
     cfg.validate()
@@ -417,8 +514,10 @@ def run_playable_training(
         if required not in dataset_files:
             raise ValueError(f"prepared dataset is missing the {required} split")
 
-    if restart_current_selfplay and not resume:
-        raise ValueError("--restart-current-selfplay requires --resume")
+    if restart_current_selfplay and restart_from_first_selfplay:
+        raise ValueError("self-play restart options are mutually exclusive")
+    if (restart_current_selfplay or restart_from_first_selfplay) and not resume:
+        raise ValueError("self-play restart options require --resume")
 
     if state_path.is_file():
         if not resume:
@@ -443,6 +542,12 @@ def run_playable_training(
             and int(state.get("iteration", -1)) == 0
             and int(state.get("rl_generated_positions", -1)) == 0
         )
+        can_rebudget_from_bootstrap = (
+            restart_from_first_selfplay
+            and state.get("stage") == "selfplay"
+            and int(state.get("iteration", 0)) >= 1
+            and state.get("candidate_checkpoint") is None
+        )
         old_non_budget = {
             key: value for key, value in old_semantic.items() if key not in _RESTART_BUDGET_FIELDS
         }
@@ -452,12 +557,13 @@ def run_playable_training(
             if key not in _RESTART_BUDGET_FIELDS
         }
         permitted_budget_change = (
-            can_rebudget_uncommitted_first_round and old_non_budget == requested_non_budget
+            (can_rebudget_uncommitted_first_round or can_rebudget_from_bootstrap)
+            and old_non_budget == requested_non_budget
         )
         if semantic_changed and not permitted_budget_change:
             raise ValueError(
                 "playable training semantics changed; only runtime settings, or the explicit "
-                "pre-RL budget migration, may change on resume"
+                "self-play restart budget migrations, may change on resume"
             )
         if schema == LEGACY_PLAYABLE_RUN_SCHEMA:
             backup_path = output / "state.v1.backup.json"
@@ -482,11 +588,18 @@ def run_playable_training(
                     "config": requested_runtime,
                 }
             )
-        if semantic_changed:
+        if semantic_changed and restart_from_first_selfplay:
+            state["budget_reconfigured_from_bootstrap"] = {
+                "old": old_semantic,
+                "new": requested_semantic,
+            }
+        elif semantic_changed:
             state["budget_reconfigured_before_rl"] = {
                 "old": old_semantic,
                 "new": requested_semantic,
             }
+        if restart_from_first_selfplay:
+            _restart_from_first_selfplay(state, output, models)
         state["config"] = config_payload
         state["semantic_config_sha256"] = _config_hash(requested_semantic)
         if restart_current_selfplay:
@@ -527,6 +640,8 @@ def run_playable_training(
             "playable_gate_passed": None,
             "abandoned_selfplay": [],
             "restart_current_selfplay_used": False,
+            "rl_restarts": [],
+            "restart_from_first_selfplay_used": False,
         }
         write_json_atomic(state_path, state)
 

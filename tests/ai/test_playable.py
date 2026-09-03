@@ -320,3 +320,112 @@ def test_v1_restart_archives_only_partial_selfplay_and_keeps_bootstrap(tmp_path:
     assert abandoned["positions"] == 6
     assert Path(abandoned["path"]).is_dir()
     assert completed["config"]["iterations"] == 1
+
+
+@pytest.mark.torch
+def test_restart_from_first_selfplay_archives_rl_and_restores_bootstrap(
+    tmp_path: Path,
+) -> None:
+    data = _prepared_dataset(tmp_path / "data")
+    output = tmp_path / "run"
+    models = tmp_path / "models"
+    config = PlayableConfig.tiny()
+    old_config = replace(config, iterations=2, simulation_schedule=(1, 1))
+
+    bootstrap = output / "bootstrap" / "bootstrap-best"
+    bootstrap_model = PolicyValueModel(ModelConfig.tiny())
+    save_checkpoint(bootstrap, bootstrap_model)
+
+    current_model = PolicyValueModel(ModelConfig.tiny())
+    with torch.no_grad():
+        next(current_model.parameters()).add_(1.0)
+    save_checkpoint(models / "best", current_model)
+    save_checkpoint(models / "rollback", bootstrap_model)
+
+    first_selfplay = output / "iteration-001" / "selfplay"
+    first_selfplay.mkdir(parents=True)
+    first_manifest = first_selfplay / "manifest.json"
+    first_manifest.write_text(
+        json.dumps({"kind": "selfplay-run", "games": 4, "positions": 100}),
+        encoding="utf-8",
+    )
+    (output / "iteration-001" / "rl").mkdir()
+    (output / "iteration-001" / "arena.json").write_text("{}", encoding="utf-8")
+    second_selfplay = output / "iteration-002" / "selfplay"
+    second_selfplay.mkdir(parents=True)
+    (second_selfplay / "manifest.json").write_text(
+        json.dumps({"kind": "selfplay-run", "games": 1, "positions": 3}),
+        encoding="utf-8",
+    )
+
+    state = {
+        "schema_version": LEGACY_PLAYABLE_RUN_SCHEMA,
+        "stage": "selfplay",
+        "iteration": 1,
+        "seed": config.seed,
+        "config": json.loads(json.dumps(asdict(old_config))),
+        "dataset_manifest": str(data / "manifest.json"),
+        "dataset_manifest_sha256": sha256_file(data / "manifest.json"),
+        "bootstrap_positions": 123,
+        "rl_generated_positions": 100,
+        "active_checkpoint": {
+            "path": str(models / "best"),
+            "weights_sha256": sha256_file(models / "best" / "weights.safetensors"),
+        },
+        "rollback_checkpoint": {
+            "path": str(models / "rollback"),
+            "weights_sha256": sha256_file(models / "rollback" / "weights.safetensors"),
+        },
+        "candidate_checkpoint": None,
+        "replay_iterations": [
+            {
+                "iteration": 1,
+                "path": str(first_selfplay),
+                "positions": 100,
+                "manifest_sha256": sha256_file(first_manifest),
+                "pruned": False,
+            }
+        ],
+        "evaluations": [{"iteration": 1, "accepted": True}],
+        "completed_steps": [
+            "bootstrap",
+            "iteration-001:selfplay",
+            "iteration-001:rl",
+            "iteration-001:arena",
+        ],
+        "playable_gate_passed": None,
+        "abandoned_selfplay": [],
+        "restart_current_selfplay_used": False,
+    }
+    (output / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    previous_best_hash = state["active_checkpoint"]["weights_sha256"]
+
+    completed = run_playable_training(
+        data,
+        output,
+        models,
+        config=config,
+        resume=True,
+        restart_from_first_selfplay=True,
+    )
+
+    assert completed["schema_version"] == PLAYABLE_RUN_SCHEMA
+    assert completed["stage"] == "complete"
+    assert completed["iteration"] == 1
+    assert completed["bootstrap_positions"] == 123
+    assert 2 <= completed["rl_generated_positions"] < 100
+    assert completed["restart_from_first_selfplay_used"] is True
+    assert completed["completed_steps"].count("bootstrap") == 1
+    assert (output / "state.v1.backup.json").is_file()
+
+    restart = completed["rl_restarts"][0]
+    archive = Path(restart["path"])
+    assert (archive / "state-before-restart.json").is_file()
+    assert (archive / "iteration-001" / "arena.json").is_file()
+    assert (archive / "iteration-002" / "selfplay" / "manifest.json").is_file()
+    assert restart["previous_iteration"] == 1
+    assert restart["previous_rl_generated_positions"] == 100
+    assert restart["archived_models"]["best"]["weights_sha256"] == previous_best_hash
+    assert restart["bootstrap_checkpoint"]["weights_sha256"] == sha256_file(
+        bootstrap / "weights.safetensors"
+    )

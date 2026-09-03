@@ -494,7 +494,9 @@ tmux attach -t chessai-train
 6. 每轮进行 20 盘 candidate 对 `best` 快速对局；
 7. 训练结束后进行 20 盘 `best` 对 Random 的可玩性检查。
 
-## 10. 从旧线程版第一轮升级并恢复
+## 10. 从旧线程版升级并恢复
+
+### 10.1 旧训练仍在第 1 轮 self-play
 
 当前云端已经完成监督预热、正在旧版第一轮 self-play 时，按以下顺序操作。先在训练
 终端按一次 `Ctrl+C` 并等待进程完全退出；旧进程仍运行时不得 `git pull`。
@@ -531,6 +533,37 @@ chessai train playable data/processed/ccpd \
 `runs/playable/abandoned/`，保留 `bootstrap_positions` 和 `checkpoints/best`，然后按
 新预算从第一轮 0 个 RL 局面开始。确认新目录已产生完整 shard 且 `runtime.json`
 持续更新后，以后的恢复不得再带 `--restart-current-selfplay`。
+
+### 10.2 旧训练已进入第 2 轮 self-play
+
+如果状态显示 `stage: selfplay`、`iteration: 1` 且
+`rl_generated_positions` 已包含旧第 1 轮，则 `--restart-current-selfplay` 只会重启
+第 2 轮，不能回到第 1 轮。不要手工改 `state.json`，改用一次性的完整 RL 回退：
+
+```bash
+chessai train playable data/processed/ccpd \
+  --output runs/playable \
+  --model-dir checkpoints \
+  --config configs/playable.yaml \
+  --resume \
+  --restart-from-first-selfplay \
+  2>&1 | tee -a artifacts/playable-console.log
+```
+
+程序会在重新生成任何局面前完成以下校验和归档：
+
+1. 复验数据 manifest、现有 best/rollback 和所有 retained replay 的 SHA-256；
+2. 验证 `runs/playable/bootstrap/bootstrap-best` 是完整且兼容的 checkpoint；
+3. 保存原始 v1 状态到 `state.v1.backup.json`；
+4. 把旧 `iteration-001`、当前部分 `iteration-002`、重启前状态以及旧 best/rollback
+   归档到 `runs/playable/abandoned/restart-from-first-selfplay-XX/`；
+5. 从 `bootstrap/bootstrap-best` 恢复 `checkpoints/best`；
+6. 把 `iteration` 和 `rl_generated_positions` 归零，只保留已完成的 bootstrap；
+7. 按当前配置重新生成第 1 轮至少 50,000 个局面。
+
+该操作不删除旧轮次或旧模型。它只允许在已经完成至少一轮、当前恰好处于下一轮
+`selfplay` 且没有活跃 candidate 时使用。执行后所有普通恢复只能带 `--resume`，
+不得再次携带 `--restart-from-first-selfplay` 或 `--restart-current-selfplay`。
 
 ## 11. 普通中断后恢复训练
 
