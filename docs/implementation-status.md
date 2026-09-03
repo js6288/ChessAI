@@ -22,7 +22,7 @@
 不是棋力结论。
 
 2026-09-03 本地验证快照：Ruff 格式/检查通过，Mypy 对 36 个源文件通过，
-69 个 Python 测试通过，native 另由 Linux CI 执行 10,000 个随机局面差分；前端 3 个组件
+70 个 Python 测试通过，native 另由 Linux CI 执行 10,000 个随机局面差分；前端 3 个组件
 测试、TypeScript、Vite 构建及桌面/窄屏 4 个 Playwright 场景通过；sdist 和 wheel
 构建通过；真实处理后 CCPD 上的 `train playable --tiny` 及 `--resume` 通过。
 
