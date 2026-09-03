@@ -325,6 +325,11 @@ _RUNTIME_CONFIG_FIELDS = {
     "selfplay_channels_last",
     "selfplay_shard_games",
 }
+_RESTART_BUDGET_FIELDS = {
+    "iterations",
+    "positions_per_iteration",
+    "simulation_schedule",
+}
 
 
 def _semantic_config(config_payload: dict[str, Any]) -> dict[str, Any]:
@@ -438,9 +443,21 @@ def run_playable_training(
             and int(state.get("iteration", -1)) == 0
             and int(state.get("rl_generated_positions", -1)) == 0
         )
-        if semantic_changed and not can_rebudget_uncommitted_first_round:
+        old_non_budget = {
+            key: value for key, value in old_semantic.items() if key not in _RESTART_BUDGET_FIELDS
+        }
+        requested_non_budget = {
+            key: value
+            for key, value in requested_semantic.items()
+            if key not in _RESTART_BUDGET_FIELDS
+        }
+        permitted_budget_change = (
+            can_rebudget_uncommitted_first_round and old_non_budget == requested_non_budget
+        )
+        if semantic_changed and not permitted_budget_change:
             raise ValueError(
-                "playable training semantics changed; only runtime settings may change on resume"
+                "playable training semantics changed; only runtime settings, or the explicit "
+                "pre-RL budget migration, may change on resume"
             )
         if schema == LEGACY_PLAYABLE_RUN_SCHEMA:
             backup_path = output / "state.v1.backup.json"

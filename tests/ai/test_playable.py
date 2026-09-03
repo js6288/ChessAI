@@ -203,6 +203,58 @@ def test_product_training_budget_is_three_times_fifty_thousand() -> None:
 
 
 @pytest.mark.torch
+def test_first_round_restart_cannot_change_seed_or_rl_semantics(tmp_path: Path) -> None:
+    data = _prepared_dataset(tmp_path / "data")
+    output = tmp_path / "run"
+    models = tmp_path / "models"
+    best = models / "best"
+    save_checkpoint(best, PolicyValueModel(ModelConfig.tiny()))
+    partial = output / "iteration-001" / "selfplay"
+    partial.mkdir(parents=True)
+    (partial / "manifest.json").write_text(
+        json.dumps({"kind": "selfplay-run", "games": 1, "positions": 2}),
+        encoding="utf-8",
+    )
+    original = PlayableConfig.tiny()
+    state = {
+        "schema_version": LEGACY_PLAYABLE_RUN_SCHEMA,
+        "stage": "selfplay",
+        "iteration": 0,
+        "seed": original.seed,
+        "config": json.loads(json.dumps(asdict(original))),
+        "dataset_manifest": str(data / "manifest.json"),
+        "dataset_manifest_sha256": sha256_file(data / "manifest.json"),
+        "bootstrap_positions": 1,
+        "rl_generated_positions": 0,
+        "active_checkpoint": {
+            "path": str(best),
+            "weights_sha256": sha256_file(best / "weights.safetensors"),
+        },
+        "rollback_checkpoint": None,
+        "candidate_checkpoint": None,
+        "replay_iterations": [],
+        "evaluations": [],
+        "completed_steps": ["bootstrap"],
+        "playable_gate_passed": None,
+    }
+    output.mkdir(exist_ok=True)
+    (output / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="training semantics changed"):
+        run_playable_training(
+            data,
+            output,
+            models,
+            config=replace(original, seed=original.seed + 1),
+            resume=True,
+            restart_current_selfplay=True,
+        )
+
+    assert partial.is_dir()
+    assert not (output / "state.v1.backup.json").exists()
+
+
+@pytest.mark.torch
 def test_v1_restart_archives_only_partial_selfplay_and_keeps_bootstrap(tmp_path: Path) -> None:
     data = _prepared_dataset(tmp_path / "data")
     output = tmp_path / "run"
