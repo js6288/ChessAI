@@ -207,9 +207,15 @@ export function Board({
               onPointerDown={(event) => startDrag(event, piece)}
               onPointerUp={() => !disabled && finishDrag(piece.square)}
             >
-              <circle r="35" className="piece-disc" />
-              <circle r="29" className="piece-ring" />
-              <text y="11" textAnchor="middle" className="piece-glyph">{piece.glyph}</text>
+              <g
+                className="piece-face"
+                data-testid={`piece-face-${piece.square}`}
+                transform={active ? "translate(0 -3)" : "translate(0 0)"}
+              >
+                <circle r="35" className="piece-disc" />
+                <circle r="29" className="piece-ring" />
+                <text y="11" textAnchor="middle" className="piece-glyph">{piece.glyph}</text>
+              </g>
             </g>
           );
         })}

@@ -49,4 +49,35 @@ describe("Board", () => {
     expect(onSquare).toHaveBeenNthCalledWith(1, "h2");
     expect(onSquare).toHaveBeenNthCalledWith(2, "e2");
   });
+
+  it("keeps the board-position transform while a piece is held for dragging", () => {
+    const onMove = vi.fn();
+    render(
+      <Board
+        pieces={pieces}
+        legalMoves={["h2e2"]}
+        lastMove={null}
+        selected={null}
+        flipped={false}
+        interactiveColor="red"
+        onSquare={vi.fn()}
+        onMove={onMove}
+      />,
+    );
+
+    const piece = screen.getByTestId("piece-h2");
+    const face = screen.getByTestId("piece-face-h2");
+    expect(piece).toHaveAttribute("transform", "translate(620 620)");
+    expect(face).toHaveAttribute("transform", "translate(0 0)");
+
+    fireEvent.pointerDown(piece, { pointerId: 1 });
+
+    expect(piece).toHaveClass("is-selected");
+    expect(piece).toHaveAttribute("transform", "translate(620 620)");
+    expect(face).toHaveAttribute("transform", "translate(0 -3)");
+
+    fireEvent.pointerUp(screen.getByTestId("square-e2"), { pointerId: 1 });
+    expect(onMove).toHaveBeenCalledOnce();
+    expect(onMove).toHaveBeenCalledWith("h2e2");
+  });
 });

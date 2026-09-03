@@ -246,7 +246,8 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .last-square { fill: rgba(166, 47, 37, .14); stroke: rgba(166, 47, 37, .38); stroke-width: 2; }
 .move-target { fill: var(--red); opacity: .67; pointer-events: none; }
 .capture-target { fill: none; stroke: var(--red); stroke-width: 6; opacity: .75; pointer-events: none; }
-.piece { cursor: grab; filter: url(#piece-shadow); transition: transform .16s ease, opacity .16s ease; transform-box: fill-box; transform-origin: center; }
+.piece { cursor: grab; filter: url(#piece-shadow); transition: opacity .16s ease; }
+.piece-face { transition: transform .16s ease; transform-box: fill-box; transform-origin: center; }
 .piece:active { cursor: grabbing; }
 .piece-disc { fill: url(#piece-paper); stroke-width: 4; }
 .piece-ring { fill: none; stroke-width: 2; }
@@ -258,7 +259,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .piece-red .piece-glyph { fill: var(--red-deep); }
 .piece-black .piece-glyph { fill: #22201c; }
 .piece.is-selected .piece-disc { stroke-width: 7; filter: brightness(1.08); }
-.piece.is-selected { transform: translateY(-3px); }
 
 .board-footnote { display: flex; justify-content: center; align-items: center; gap: 10px; min-height: 32px; color: var(--ink-3); font: 600 9px ui-monospace, Consolas, monospace; letter-spacing: .08em; }
 .board-footnote i { width: 3px; height: 3px; border-radius: 50%; background: var(--red); }
