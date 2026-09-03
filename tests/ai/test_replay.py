@@ -11,6 +11,8 @@ from chessai.training.replay import (
     ReplayDataset,
     ReplaySample,
     ReplayShard,
+    combine_packed_replay,
+    pack_replay_samples,
     read_replay_metadata,
     save_replay_shard,
 )
@@ -44,6 +46,24 @@ def test_sparse_replay_shard_round_trip(tmp_path) -> None:
 
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         save_replay_shard(path, [sample], network_hash="test", simulations=8, seed=1, games=1)
+
+
+def test_packed_actor_payload_combines_without_changing_replay(tmp_path) -> None:
+    state = GameState.initial()
+    samples = [
+        ReplaySample(
+            features=encode_state(state),
+            action_ids=np.asarray([2, 9], dtype=np.uint16),
+            probabilities=np.asarray([0.4, 0.6], dtype=np.float32),
+            value=float(value),
+        )
+        for value in (-1, 1)
+    ]
+    combined = combine_packed_replay(
+        [pack_replay_samples(samples[:1]), pack_replay_samples(samples[1:])]
+    )
+    assert combined.positions == 2
+    assert combined.policy_offsets.tolist() == [0, 2, 4]
 
 
 def test_replay_capacity_loads_only_the_newest_shards(tmp_path, monkeypatch) -> None:

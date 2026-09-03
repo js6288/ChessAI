@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from chessai.compat import RULE_VERSION
+
+if TYPE_CHECKING:
+    from chessai.engine.board import Color
 
 try:
     import _chessai_native as _native  # type: ignore[import-not-found]
@@ -56,3 +59,36 @@ def legal_moves(fen: str) -> tuple[str, ...] | None:
     if selected_backend() == "reference":
         return None
     return tuple(_native.legal_moves(fen))
+
+
+def legal_move_codes(fen: str) -> tuple[int, ...] | None:
+    """Return compact ``from * 90 + to`` codes, or ``None`` in reference mode."""
+
+    if selected_backend() == "reference":
+        return None
+    if not hasattr(_native, "legal_move_codes"):
+        # A source update can precede the required native rebuild. Keep the
+        # old extension usable, with a small conversion cost, until CMake runs.
+        codes = []
+        for text in _native.legal_moves(fen):
+            from_index = int(text[1]) * 9 + (ord(text[0]) - ord("a"))
+            to_index = int(text[3]) * 9 + (ord(text[2]) - ord("a"))
+            codes.append(from_index * 90 + to_index)
+        return tuple(codes)
+    return tuple(int(code) for code in _native.legal_move_codes(fen))
+
+
+def is_in_check(fen: str, color: Color | None = None) -> bool | None:
+    """Use the native attack detector when selected, otherwise request fallback."""
+
+    if selected_backend() == "reference":
+        return None
+    return bool(_native.is_in_check(fen, color.value if color is not None else None))
+
+
+def is_in_check_board(board: tuple[str, ...], color: Color) -> bool | None:
+    """Check a compact 90-square board without formatting/parsing FEN."""
+
+    if selected_backend() == "reference" or not hasattr(_native, "is_in_check_board"):
+        return None
+    return bool(_native.is_in_check_board("".join(board), color.value))

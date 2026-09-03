@@ -64,10 +64,26 @@ class BatchedTorchEvaluator:
         device: str | torch.device = "cpu",
         *,
         precision: str = "auto",
+        channels_last: bool = False,
+        max_batch_size: int | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
+        self.channels_last = channels_last
+        if channels_last:
+            self.model = self.model.to(  # type: ignore[call-overload]
+                memory_format=torch.channels_last
+            )
         self.use_bf16 = _use_bf16(self.device, precision)
+        self._host_buffer = (
+            torch.empty(
+                (max_batch_size, 117, 10, 9),
+                dtype=torch.float32,
+                pin_memory=True,
+            )
+            if self.device.type == "cuda" and max_batch_size is not None
+            else None
+        )
 
     def _forward(self, batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.use_bf16:
@@ -84,9 +100,34 @@ class BatchedTorchEvaluator:
                 np.empty((0, self.model.config.action_size), dtype=np.float32),
                 np.empty((0,), dtype=np.float32),
             )
-        batch = torch.from_numpy(np.stack([encode_state(state) for state in states])).to(
-            self.device
-        )
+        return self.evaluate_features(np.stack([encode_state(state) for state in states]))
+
+    @torch.inference_mode()
+    def evaluate_features(
+        self, features: npt.NDArray[np.float32]
+    ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+        """Evaluate an already encoded contiguous NCHW feature batch."""
+
+        if features.ndim != 4 or features.shape[1:] != (117, 10, 9):
+            raise ValueError(f"unexpected feature batch shape: {features.shape}")
+        if features.shape[0] == 0:
+            return (
+                np.empty((0, self.model.config.action_size), dtype=np.float32),
+                np.empty((0,), dtype=np.float32),
+            )
+        contiguous = np.ascontiguousarray(features, dtype=np.float32)
+        if self._host_buffer is not None:
+            if contiguous.shape[0] > self._host_buffer.shape[0]:
+                raise ValueError("feature batch exceeds the preallocated pinned buffer")
+            host = self._host_buffer[: contiguous.shape[0]]
+            host.copy_(torch.from_numpy(contiguous))
+        else:
+            host = torch.from_numpy(contiguous)
+            if self.device.type == "cuda":
+                host = host.pin_memory()
+        batch = host.to(self.device, non_blocking=self.device.type == "cuda")
+        if self.channels_last:
+            batch = batch.contiguous(memory_format=torch.channels_last)
         logits, values = self._forward(batch)
         return logits.float().cpu().numpy(), values.float().cpu().numpy()
 

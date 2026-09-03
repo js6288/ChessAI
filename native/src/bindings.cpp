@@ -92,6 +92,22 @@ struct Position {
   int halfmove_clock{0};
   int fullmove_number{1};
 
+  static Position from_compact(std::string_view pieces, Color side) {
+    if (pieces.size() != kSquares) {
+      throw std::invalid_argument("compact board must contain 90 squares");
+    }
+    Position position;
+    position.side_to_move = side;
+    for (int index = 0; index < kSquares; ++index) {
+      const char piece = pieces[static_cast<std::size_t>(index)];
+      if (piece != '.' && !valid_piece(piece)) {
+        throw std::invalid_argument("invalid compact board piece");
+      }
+      position.board[static_cast<std::size_t>(index)] = piece;
+    }
+    return position;
+  }
+
   static Position from_fen(std::string_view fen) {
     std::istringstream input{std::string(fen)};
     std::vector<std::string> parts;
@@ -256,7 +272,7 @@ struct Position {
   void add_step_moves(std::vector<Move>& moves, Square origin, char piece,
                       const std::vector<std::pair<int, int>>& offsets) const {
     const Color color = piece_color(piece);
-    for (const auto [df, dr] : offsets) {
+    for (const auto& [df, dr] : offsets) {
       const int file = origin.file + df;
       const int rank = origin.rank + dr;
       if (!inside(file, rank)) continue;
@@ -276,7 +292,7 @@ struct Position {
       const Color color = piece_color(piece);
       const char kind = static_cast<char>(std::toupper(static_cast<unsigned char>(piece)));
       if (kind == 'R' || kind == 'C') {
-        for (const auto [df, dr] : std::array<std::pair<int, int>, 4>{
+        for (const auto& [df, dr] : std::array<std::pair<int, int>, 4>{
                  std::pair{1, 0}, std::pair{-1, 0}, std::pair{0, 1}, std::pair{0, -1}}) {
           int file = origin.file + df;
           int rank = origin.rank + dr;
@@ -384,6 +400,15 @@ struct Position {
   return result;
 }
 
+[[nodiscard]] std::vector<std::uint16_t> legal_move_codes(std::string_view fen) {
+  const Position position = Position::from_fen(fen);
+  std::vector<std::uint16_t> result;
+  for (const Move move : position.legal_moves()) {
+    result.push_back(static_cast<std::uint16_t>(move.from.index() * kSquares + move.to.index()));
+  }
+  return result;
+}
+
 [[nodiscard]] std::uint64_t perft_position(const Position& position, int depth) {
   if (depth == 0) return 1;
   std::uint64_t nodes = 0;
@@ -400,6 +425,8 @@ PYBIND11_MODULE(_chessai_native, module) {
   module.attr("RULE_VERSION") = std::string(chessai::kRuleVersion);
   module.def("legal_moves", &chessai::legal_move_strings, py::arg("fen"),
              py::call_guard<py::gil_scoped_release>());
+  module.def("legal_move_codes", &chessai::legal_move_codes, py::arg("fen"),
+             py::call_guard<py::gil_scoped_release>());
   module.def("apply_move", [](std::string_view fen, std::string_view move) {
     return chessai::Position::from_fen(fen).apply_legal(chessai::parse_move(move)).to_fen();
   }, py::arg("fen"), py::arg("move"), py::call_guard<py::gil_scoped_release>());
@@ -414,6 +441,13 @@ PYBIND11_MODULE(_chessai_native, module) {
     return position.in_check(checked);
   }, py::arg("fen"), py::arg("color") = py::none(),
   py::call_guard<py::gil_scoped_release>());
+  module.def("is_in_check_board", [](std::string_view board, std::string_view color) {
+    chessai::Color checked;
+    if (color == "red") checked = chessai::Color::Red;
+    else if (color == "black") checked = chessai::Color::Black;
+    else throw std::invalid_argument("color must be red or black");
+    return chessai::Position::from_compact(board, checked).in_check(checked);
+  }, py::arg("board"), py::arg("color"), py::call_guard<py::gil_scoped_release>());
   module.def("position_key", [](std::string_view fen) {
     return chessai::Position::from_fen(fen).position_key();
   }, py::arg("fen"), py::call_guard<py::gil_scoped_release>());

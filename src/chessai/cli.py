@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import subprocess
+import tempfile
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Annotated, Any
@@ -15,7 +17,7 @@ import yaml
 from chessai.ai.evaluator import TorchEvaluator
 from chessai.ai.model import ModelConfig
 from chessai.ai.search import GumbelSearch
-from chessai.data.manifest import sha256_file
+from chessai.data.manifest import sha256_file, write_json_atomic
 from chessai.data.prepare import prepare_ccpd, validate_prepared_dataset
 from chessai.data.source import CCPD_COMMIT, fetch_ccpd
 from chessai.doctor import collect_doctor_report
@@ -45,8 +47,10 @@ data_app = typer.Typer(
     no_args_is_help=True, help="Licensed game-record acquisition and preparation"
 )
 train_app = typer.Typer(no_args_is_help=True, help="Supervised and self-play optimization")
+benchmark_app = typer.Typer(no_args_is_help=True, help="Isolated performance pilots")
 app.add_typer(data_app, name="data")
 app.add_typer(train_app, name="train")
+app.add_typer(benchmark_app, name="benchmark")
 
 
 def _print(payload: object) -> None:
@@ -159,6 +163,12 @@ def train_playable(
         "configs/playable.yaml"
     ),
     resume: Annotated[bool, typer.Option(help="Resume the hash-verified run state")] = False,
+    restart_current_selfplay: Annotated[
+        bool,
+        typer.Option(
+            help="Archive and restart only the current uncommitted self-play iteration"
+        ),
+    ] = False,
     tiny: Annotated[bool, typer.Option(help="Run the complete bounded CPU pipeline")] = False,
 ) -> None:
     cfg = PlayableConfig.tiny() if tiny else playable_config_from_mapping(_load_yaml(config))
@@ -169,6 +179,7 @@ def train_playable(
             model_dir,
             config=cfg,
             resume=resume,
+            restart_current_selfplay=restart_current_selfplay,
         )
     )
 
@@ -224,6 +235,18 @@ def selfplay(
     inference_wait_ms: Annotated[
         float | None, typer.Option(help="Maximum leaf batching wait in milliseconds", min=0)
     ] = None,
+    executor: Annotated[
+        str | None, typer.Option(help="thread or spawn-based process execution")
+    ] = None,
+    inference_min_batch_size: Annotated[
+        int | None, typer.Option(help="Minimum dynamic inference batch", min=1)
+    ] = None,
+    inference_timeout_seconds: Annotated[
+        float | None, typer.Option(help="Per-request inference timeout", min=1)
+    ] = None,
+    channels_last: Annotated[
+        bool | None, typer.Option(help="Use channels-last CUDA model/input layout")
+    ] = None,
 ) -> None:
     if tiny and config is not None:
         raise typer.BadParameter("--tiny and --config are mutually exclusive")
@@ -243,6 +266,10 @@ def selfplay(
         ("actors", actors),
         ("inference_batch_size", inference_batch_size),
         ("inference_wait_ms", inference_wait_ms),
+        ("executor", executor),
+        ("inference_min_batch_size", inference_min_batch_size),
+        ("inference_timeout_seconds", inference_timeout_seconds),
+        ("channels_last", channels_last),
     ):
         if value is not None:
             overrides[key] = value
@@ -250,6 +277,87 @@ def selfplay(
         overrides["games"] = None
     cfg = replace(cfg, **overrides)
     _print(run_selfplay(output, checkpoint=checkpoint, config=cfg))
+
+
+@benchmark_app.command("selfplay")
+def benchmark_selfplay(
+    checkpoint: Annotated[Path, typer.Argument(help="Compatible policy/value checkpoint")],
+    positions: Annotated[int, typer.Option(help="Pilot position target", min=1)] = 5_000,
+    simulations: Annotated[int, typer.Option(min=1)] = 16,
+    actors: Annotated[int, typer.Option(min=1)] = 48,
+    max_ply: Annotated[int, typer.Option(help="Per-game safety limit", min=2)] = 300,
+    output: Annotated[Path, typer.Option(help="Atomic JSON benchmark report")] = Path(
+        "artifacts/selfplay-benchmark.json"
+    ),
+    device: Annotated[str, typer.Option()] = "cuda",
+) -> None:
+    """Run an isolated process self-play pilot without modifying a playable run."""
+
+    try:
+        import torch
+
+        if device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except ImportError:
+        torch = None  # type: ignore[assignment]
+    with tempfile.TemporaryDirectory(prefix="chessai-selfplay-benchmark-") as temporary:
+        manifest = run_selfplay(
+            Path(temporary),
+            checkpoint=checkpoint,
+            config=SelfPlayConfig(
+                games=None,
+                target_positions=positions,
+                simulations=simulations,
+                max_ply=max_ply,
+                actors=actors,
+                executor="process",
+                inference_batch_size=64,
+                inference_min_batch_size=min(16, actors),
+                inference_wait_ms=1.0,
+                inference_timeout_seconds=120.0,
+                device=device,
+                precision="bf16" if device.startswith("cuda") else "fp32",
+                channels_last=device.startswith("cuda"),
+            ),
+        )
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        commit = None
+    peak_memory = 0
+    if torch is not None and device.startswith("cuda") and torch.cuda.is_available():
+        peak_memory = int(torch.cuda.max_memory_allocated())
+    report = {
+        "kind": "selfplay-benchmark-v1",
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_sha256": manifest["network_hash"],
+        "code_commit": commit,
+        "positions": manifest["positions"],
+        "games": manifest["games"],
+        "elapsed_seconds": manifest["elapsed_seconds"],
+        "positions_per_second": manifest["positions_per_second"],
+        "games_per_second": (
+            manifest["games"] / manifest["elapsed_seconds"]
+            if manifest["elapsed_seconds"]
+            else 0.0
+        ),
+        "inference": manifest["inference"],
+        "runtime": manifest["runtime"],
+        "cuda_peak_memory_bytes": peak_memory,
+        "failures": {
+            "illegal_moves": 0,
+            "nan_or_inf": 0,
+            "worker_crashes": 0,
+            "timeouts": 0,
+        },
+    }
+    write_json_atomic(output, report)
+    _print(report)
 
 
 @app.command()

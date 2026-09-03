@@ -4,7 +4,7 @@ import random
 import pytest
 
 from chessai.engine import GameState
-from chessai.native import available, module
+from chessai.native import available, legal_move_codes, module
 
 
 @pytest.mark.skipif(not available(), reason="optional native backend is not built")
@@ -37,8 +37,20 @@ def test_native_perft_and_random_reachable_positions_match_reference() -> None:
             state = initial
         reference_moves = {str(move) for move in state.reference_legal_moves()}
         assert set(native.legal_moves(state.to_fen())) == reference_moves
+        codes = legal_move_codes(state.to_fen())
+        assert codes is not None
+        compact_moves = {
+            f"{'abcdefghi'[code // 90 % 9]}{code // 90 // 9}"
+            f"{'abcdefghi'[code % 90 % 9]}{code % 90 // 9}"
+            for code in codes
+        }
+        assert compact_moves == reference_moves
         assert native.position_key(state.to_fen()) == state.position_key
         assert native.is_in_check(state.to_fen()) == state.is_in_check()
+        if hasattr(native, "is_in_check_board"):
+            assert native.is_in_check_board("".join(state.board), state.side_to_move.value) == (
+                state.is_in_check()
+            )
         checked += 1
         move = randomizer.choice(state.legal_moves)
         native_fen = native.apply_move(state.to_fen(), str(move))

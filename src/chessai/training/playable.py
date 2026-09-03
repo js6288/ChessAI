@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -27,7 +28,8 @@ from chessai.training.checkpoint import load_checkpoint
 from chessai.training.rl import RlTrainConfig, run_rl_training
 from chessai.training.selfplay import SelfPlayConfig, run_selfplay
 
-PLAYABLE_RUN_SCHEMA = "playable-run-v1"
+PLAYABLE_RUN_SCHEMA = "playable-run-v2"
+LEGACY_PLAYABLE_RUN_SCHEMA = "playable-run-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,15 +43,19 @@ class PlayableConfig:
             precision="bf16",
         )
     )
-    iterations: int = 5
-    positions_per_iteration: int = 100_000
-    simulation_schedule: tuple[int, ...] = (16, 16, 32, 32, 32)
+    iterations: int = 3
+    positions_per_iteration: int = 50_000
+    simulation_schedule: tuple[int, ...] = (16, 16, 32)
     selfplay_sample_until_ply: int = 30
     selfplay_max_ply: int = 300
     selfplay_shard_games: int = 16
-    selfplay_actors: int = 12
-    inference_batch_size: int = 128
-    inference_wait_ms: float = 2.0
+    selfplay_executor: str = "process"
+    selfplay_actors: int = 48
+    inference_batch_size: int = 64
+    inference_min_batch_size: int = 16
+    inference_wait_ms: float = 1.0
+    inference_timeout_seconds: float = 120.0
+    selfplay_channels_last: bool = True
     selfplay_device: str = "cuda"
     selfplay_precision: str = "bf16"
     rl: RlTrainConfig = field(
@@ -86,6 +92,14 @@ class PlayableConfig:
             raise ValueError("final_games must be a positive even number")
         if self.arena_openings <= 0 or self.keep_replay_iterations <= 0:
             raise ValueError("arena_openings and keep_replay_iterations must be positive")
+        if self.selfplay_executor not in {"thread", "process"}:
+            raise ValueError("selfplay_executor must be thread or process")
+        if self.selfplay_actors <= 0:
+            raise ValueError("selfplay_actors must be positive")
+        if not 1 <= self.inference_min_batch_size <= self.inference_batch_size:
+            raise ValueError("inference batch minimum must be within the maximum")
+        if self.inference_wait_ms < 0 or self.inference_timeout_seconds <= 0:
+            raise ValueError("inference wait/timeout values are invalid")
         if not 0.0 <= self.candidate_score_min <= 1.0:
             raise ValueError("candidate_score_min must be between zero and one")
         if not 0.0 <= self.final_score_min <= 1.0:
@@ -101,8 +115,12 @@ class PlayableConfig:
             selfplay_sample_until_ply=1,
             selfplay_max_ply=2,
             selfplay_shard_games=1,
-            selfplay_actors=1,
-            inference_batch_size=1,
+            selfplay_executor="process",
+            selfplay_actors=2,
+            inference_batch_size=2,
+            inference_min_batch_size=1,
+            inference_timeout_seconds=30.0,
+            selfplay_channels_last=False,
             selfplay_device="cpu",
             selfplay_precision="fp32",
             rl=RlTrainConfig.tiny(),
@@ -125,21 +143,25 @@ def playable_config_from_mapping(mapping: dict[str, Any]) -> PlayableConfig:
     selfplay = dict(cast(dict[str, Any], mapping.get("selfplay", {})))
     evaluation = dict(cast(dict[str, Any], mapping.get("evaluation", {})))
     pipeline = dict(cast(dict[str, Any], mapping.get("pipeline", {})))
-    schedule = pipeline.pop("simulation_schedule", (16, 16, 32, 32, 32))
+    schedule = pipeline.pop("simulation_schedule", (16, 16, 32))
     config = PlayableConfig(
         bootstrap=bootstrap,
         rl=rl,
         simulation_schedule=tuple(int(value) for value in schedule),
-        iterations=int(pipeline.pop("iterations", 5)),
-        positions_per_iteration=int(pipeline.pop("positions_per_iteration", 100_000)),
+        iterations=int(pipeline.pop("iterations", 3)),
+        positions_per_iteration=int(pipeline.pop("positions_per_iteration", 50_000)),
         seed=int(pipeline.pop("seed", 20260902)),
         keep_replay_iterations=int(pipeline.pop("keep_replay_iterations", 3)),
         selfplay_sample_until_ply=int(selfplay.pop("sample_until_ply", 30)),
         selfplay_max_ply=int(selfplay.pop("max_ply", 300)),
         selfplay_shard_games=int(selfplay.pop("shard_games", 16)),
-        selfplay_actors=int(selfplay.pop("actors", 12)),
-        inference_batch_size=int(selfplay.pop("inference_batch_size", 128)),
-        inference_wait_ms=float(selfplay.pop("inference_wait_ms", 2.0)),
+        selfplay_executor=str(selfplay.pop("executor", "process")),
+        selfplay_actors=int(selfplay.pop("actors", 48)),
+        inference_batch_size=int(selfplay.pop("inference_batch_size", 64)),
+        inference_min_batch_size=int(selfplay.pop("inference_min_batch_size", 16)),
+        inference_wait_ms=float(selfplay.pop("inference_wait_ms", 1.0)),
+        inference_timeout_seconds=float(selfplay.pop("inference_timeout_seconds", 120.0)),
+        selfplay_channels_last=bool(selfplay.pop("channels_last", True)),
         selfplay_device=str(selfplay.pop("device", "cuda")),
         selfplay_precision=str(selfplay.pop("precision", "bf16")),
         arena_games=int(evaluation.pop("arena_games", 20)),
@@ -293,6 +315,78 @@ def _validate_resume_artifacts(state: dict[str, Any]) -> None:
             raise ValueError(f"retained replay manifest hash changed: {manifest}")
 
 
+_RUNTIME_CONFIG_FIELDS = {
+    "selfplay_executor",
+    "selfplay_actors",
+    "inference_batch_size",
+    "inference_min_batch_size",
+    "inference_wait_ms",
+    "inference_timeout_seconds",
+    "selfplay_channels_last",
+    "selfplay_shard_games",
+}
+
+
+def _semantic_config(config_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in config_payload.items()
+        if key not in _RUNTIME_CONFIG_FIELDS
+    }
+
+
+def _runtime_config(config_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: config_payload.get(key)
+        for key in sorted(_RUNTIME_CONFIG_FIELDS)
+        if key in config_payload
+    }
+
+
+def _config_hash(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _archive_current_selfplay(state: dict[str, Any], output: Path) -> dict[str, Any]:
+    if state.get("stage") != "selfplay":
+        raise ValueError("--restart-current-selfplay is only valid during the selfplay stage")
+    if state.get("restart_current_selfplay_used"):
+        raise ValueError("--restart-current-selfplay was already used for this run")
+    iteration_number = int(state.get("iteration", 0)) + 1
+    source = output / f"iteration-{iteration_number:03d}" / "selfplay"
+    if not source.is_dir():
+        raise FileNotFoundError(f"current partial self-play directory does not exist: {source}")
+    abandoned = output / "abandoned"
+    abandoned.mkdir(parents=True, exist_ok=True)
+    suffix = 1
+    destination = abandoned / f"iteration-{iteration_number:03d}-selfplay-{suffix:02d}"
+    while destination.exists():
+        suffix += 1
+        destination = abandoned / f"iteration-{iteration_number:03d}-selfplay-{suffix:02d}"
+    manifest_path = source / "manifest.json"
+    manifest: dict[str, Any] = {}
+    manifest_hash: str | None = None
+    if manifest_path.is_file():
+        loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            manifest = cast(dict[str, Any], loaded)
+        manifest_hash = sha256_file(manifest_path)
+    os.replace(source, destination)
+    record = {
+        "iteration": iteration_number,
+        "path": str(destination),
+        "manifest_sha256": manifest_hash,
+        "games": int(manifest.get("games", 0)),
+        "positions": int(manifest.get("positions", 0)),
+        "positions_per_second": float(manifest.get("positions_per_second", 0.0)),
+        "runtime": manifest.get("runtime", manifest.get("last_invocation_config", {})),
+    }
+    cast(list[dict[str, Any]], state.setdefault("abandoned_selfplay", [])).append(record)
+    state["restart_current_selfplay_used"] = True
+    return record
+
+
 def run_playable_training(
     data_dir: str | Path,
     output_dir: str | Path,
@@ -300,6 +394,7 @@ def run_playable_training(
     *,
     config: PlayableConfig | None = None,
     resume: bool = False,
+    restart_current_selfplay: bool = False,
 ) -> dict[str, Any]:
     cfg = config or PlayableConfig()
     cfg.validate()
@@ -317,6 +412,9 @@ def run_playable_training(
         if required not in dataset_files:
             raise ValueError(f"prepared dataset is missing the {required} split")
 
+    if restart_current_selfplay and not resume:
+        raise ValueError("--restart-current-selfplay requires --resume")
+
     if state_path.is_file():
         if not resume:
             raise FileExistsError("playable output already has state.json; pass --resume")
@@ -324,13 +422,59 @@ def run_playable_training(
         if not isinstance(loaded_state, dict):
             raise ValueError("playable run state root must be an object")
         state = cast(dict[str, Any], loaded_state)
-        if state.get("schema_version") != PLAYABLE_RUN_SCHEMA:
+        schema = state.get("schema_version")
+        if schema not in {PLAYABLE_RUN_SCHEMA, LEGACY_PLAYABLE_RUN_SCHEMA}:
             raise ValueError(f"unsupported playable run state: {state.get('schema_version')!r}")
         if state.get("dataset_manifest_sha256") != sha256_file(data_root / "manifest.json"):
             raise ValueError("prepared dataset manifest changed since the run started")
-        if state.get("config") != config_payload:
-            raise ValueError("playable configuration changed; resume requires the original profile")
         _validate_resume_artifacts(state)
+        old_config = cast(dict[str, Any], state.get("config", {}))
+        old_semantic = _semantic_config(old_config)
+        requested_semantic = _semantic_config(config_payload)
+        semantic_changed = old_semantic != requested_semantic
+        can_rebudget_uncommitted_first_round = (
+            restart_current_selfplay
+            and state.get("stage") == "selfplay"
+            and int(state.get("iteration", -1)) == 0
+            and int(state.get("rl_generated_positions", -1)) == 0
+        )
+        if semantic_changed and not can_rebudget_uncommitted_first_round:
+            raise ValueError(
+                "playable training semantics changed; only runtime settings may change on resume"
+            )
+        if schema == LEGACY_PLAYABLE_RUN_SCHEMA:
+            backup_path = output / "state.v1.backup.json"
+            if not backup_path.exists():
+                write_json_atomic(backup_path, state)
+            state["schema_version"] = PLAYABLE_RUN_SCHEMA
+            state["migrated_from"] = LEGACY_PLAYABLE_RUN_SCHEMA
+        runtime_history = cast(list[dict[str, Any]], state.setdefault("runtime_history", []))
+        previous_runtime = _runtime_config(old_config)
+        requested_runtime = _runtime_config(config_payload)
+        if not runtime_history or runtime_history[-1].get("config") != previous_runtime:
+            runtime_history.append(
+                {
+                    "source_schema": schema,
+                    "config": previous_runtime,
+                }
+            )
+        if requested_runtime != previous_runtime:
+            runtime_history.append(
+                {
+                    "source_schema": PLAYABLE_RUN_SCHEMA,
+                    "config": requested_runtime,
+                }
+            )
+        if semantic_changed:
+            state["budget_reconfigured_before_rl"] = {
+                "old": old_semantic,
+                "new": requested_semantic,
+            }
+        state["config"] = config_payload
+        state["semantic_config_sha256"] = _config_hash(requested_semantic)
+        if restart_current_selfplay:
+            _archive_current_selfplay(state, output)
+        write_json_atomic(state_path, state)
     else:
         if resume:
             raise FileNotFoundError(f"playable state does not exist: {state_path}")
@@ -346,6 +490,13 @@ def run_playable_training(
             "iteration": 0,
             "seed": cfg.seed,
             "config": config_payload,
+            "semantic_config_sha256": _config_hash(_semantic_config(config_payload)),
+            "runtime_history": [
+                {
+                    "source_schema": PLAYABLE_RUN_SCHEMA,
+                    "config": _runtime_config(config_payload),
+                }
+            ],
             "dataset_manifest": str(data_root / "manifest.json"),
             "dataset_manifest_sha256": sha256_file(data_root / "manifest.json"),
             "bootstrap_positions": 0,
@@ -357,6 +508,8 @@ def run_playable_training(
             "evaluations": [],
             "completed_steps": [],
             "playable_gate_passed": None,
+            "abandoned_selfplay": [],
+            "restart_current_selfplay_used": False,
         }
         write_json_atomic(state_path, state)
 
@@ -410,9 +563,13 @@ def run_playable_training(
                 seed=cfg.seed + iteration_index * 1_000_000,
                 shard_games=cfg.selfplay_shard_games,
                 device=cfg.selfplay_device,
+                executor=cfg.selfplay_executor,
                 actors=cfg.selfplay_actors,
                 inference_batch_size=cfg.inference_batch_size,
+                inference_min_batch_size=cfg.inference_min_batch_size,
                 inference_wait_ms=cfg.inference_wait_ms,
+                inference_timeout_seconds=cfg.inference_timeout_seconds,
+                channels_last=cfg.selfplay_channels_last,
                 precision=cfg.selfplay_precision,
             )
             manifest = run_selfplay(replay_dir, checkpoint=best_path, config=selfplay_config)

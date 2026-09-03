@@ -69,8 +69,8 @@ class MoveRecord:
     move: Move
     mover: Color
     captured_piece: str | None
-    gave_check: bool
-    chased_targets: tuple[str, ...] = ()
+    gave_check: bool | None = None
+    chased_targets: tuple[str, ...] | None = None
 
 
 def _piece_color(piece: str) -> Color:
@@ -209,6 +209,11 @@ class GameState:
 
     def is_in_check(self, color: Color | None = None) -> bool:
         checked_color = self.side_to_move if color is None else color
+        from chessai.native import is_in_check_board as native_is_in_check
+
+        accelerated = native_is_in_check(self.board, checked_color)
+        if accelerated is not None:
+            return accelerated
         general = self.general_square(checked_color)
         if general is None:
             return True
@@ -377,11 +382,14 @@ class GameState:
         """Generate moves without applying repetition or the configured ply limit."""
 
         # Import lazily to keep the reference engine independently importable.
-        from chessai.native import legal_moves as native_legal_moves
+        from chessai.native import legal_move_codes as native_legal_move_codes
 
-        accelerated = native_legal_moves(self.to_fen())
+        accelerated = native_legal_move_codes(self.to_fen())
         if accelerated is not None:
-            return tuple(Move.from_iccs(move) for move in accelerated)
+            return tuple(
+                Move(Square.from_index(code // 90), Square.from_index(code % 90))
+                for code in accelerated
+            )
         return self.reference_legal_moves()
 
     @cached_property
@@ -436,8 +444,6 @@ class GameState:
             move=move,
             mover=self.side_to_move,
             captured_piece=None if captured == EMPTY else captured,
-            gave_check=provisional.is_in_check(next_side),
-            chased_targets=provisional._direct_chase_targets(self.side_to_move),
         )
         return GameState(
             board=provisional.board,
@@ -473,6 +479,23 @@ class GameState:
     def repetition_count(self) -> int:
         return self.position_history.count(self.position_key)
 
+    def _annotate_record(self, index: int, record: MoveRecord) -> MoveRecord:
+        """Compute expensive repetition annotations only when adjudication needs them."""
+
+        if record.gave_check is not None and record.chased_targets is not None:
+            return record
+        resulting_key = self.position_history[index + 1]
+        board = tuple(resulting_key[:90])
+        side = Color.RED if resulting_key[90] == "w" else Color.BLACK
+        resulting_state = GameState(board=board, side_to_move=side, max_ply=self.max_ply)
+        return MoveRecord(
+            move=record.move,
+            mover=record.mover,
+            captured_piece=record.captured_piece,
+            gave_check=resulting_state.is_in_check(record.mover.opponent),
+            chased_targets=resulting_state._direct_chase_targets(record.mover),
+        )
+
     def _repetition_outcome(self) -> Outcome:
         occurrences = [
             index for index, key in enumerate(self.position_history) if key == self.position_key
@@ -480,7 +503,10 @@ class GameState:
         if len(occurrences) < 3:
             return Outcome(GameStatus.ONGOING)
         start = occurrences[-3]
-        records = self.move_records[start:]
+        records = tuple(
+            self._annotate_record(index, record)
+            for index, record in enumerate(self.move_records[start:], start=start)
+        )
         if not records:
             return Outcome(GameStatus.DRAW, reason="threefold_repetition")
 
@@ -488,7 +514,7 @@ class GameState:
             color
             for color in (Color.RED, Color.BLACK)
             if any(record.mover is color for record in records)
-            and all(record.gave_check for record in records if record.mover is color)
+            and all(record.gave_check is True for record in records if record.mover is color)
         ]
         if len(perpetual_checkers) == 1:
             loser = perpetual_checkers[0]
@@ -503,8 +529,11 @@ class GameState:
         for color in (Color.RED, Color.BLACK):
             own_records = [record for record in records if record.mover is color]
             if own_records and all(record.chased_targets for record in own_records):
-                common = set(own_records[0].chased_targets)
+                first_targets = own_records[0].chased_targets
+                assert first_targets is not None
+                common = set(first_targets)
                 for record in own_records[1:]:
+                    assert record.chased_targets is not None
                     common.intersection_update(record.chased_targets)
                 if common:
                     perpetual_chasers.append(color)
@@ -534,7 +563,8 @@ class GameState:
             return Outcome(GameStatus.DRAW, reason="max_ply_limit")
         return Outcome(GameStatus.ONGOING)
 
-    def outcome(self) -> Outcome:
+    @cached_property
+    def _cached_outcome(self) -> Outcome:
         terminal = self._terminal_without_move_generation()
         if terminal.terminal:
             return terminal
@@ -546,6 +576,9 @@ class GameState:
             winner=winner,
             reason="checkmate" if self.is_in_check() else "stalemate",
         )
+
+    def outcome(self) -> Outcome:
+        return self._cached_outcome
 
     def legal_move_strings(self) -> tuple[str, ...]:
         return tuple(str(move) for move in self.legal_moves)

@@ -81,7 +81,9 @@ class Node:
 
     def child(self, move: Move) -> Node:
         if move not in self.children:
-            self.children[move] = Node(self.state.apply(move), prior=self.priors[move])
+            self.children[move] = Node(
+                self.state.apply(move, validate=False), prior=self.priors[move]
+            )
         return self.children[move]
 
 
@@ -299,7 +301,7 @@ class GumbelSearch:
         child = root.child(root_move)
         path = [root, child]
         node = child
-        while node.expanded and node.priors and not node.state.outcome().terminal:
+        while node.expanded and node.priors:
             move = self._select_interior(node)
             node = node.child(move)
             path.append(node)

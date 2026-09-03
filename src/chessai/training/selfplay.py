@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,14 @@ from chessai.engine import Color, GameState
 from chessai.engine.vocabulary import encode_move
 from chessai.training.checkpoint import load_checkpoint
 from chessai.training.metrics import MetricsWriter
-from chessai.training.replay import ReplaySample, save_replay_shard
+from chessai.training.process_selfplay import ProcessRuntimeConfig, ProcessSelfPlayExecutor
+from chessai.training.replay import (
+    PackedReplayBatch,
+    ReplaySample,
+    combine_packed_replay,
+    pack_replay_samples,
+    save_packed_replay_shard,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +45,10 @@ class SelfPlayConfig:
     inference_batch_size: int = 64
     inference_wait_ms: float = 2.0
     precision: str = "auto"
+    executor: str = "thread"
+    inference_min_batch_size: int = 1
+    inference_timeout_seconds: float = 120.0
+    channels_last: bool = False
 
     @classmethod
     def tiny(cls) -> SelfPlayConfig:
@@ -174,11 +186,31 @@ def run_selfplay(
         raise ValueError("shard_games and actors must be positive")
     if cfg.inference_batch_size <= 0 or cfg.inference_wait_ms < 0:
         raise ValueError("inference batch size must be positive and wait must be non-negative")
+    if cfg.executor not in {"thread", "process"}:
+        raise ValueError("self-play executor must be thread or process")
+    if not 1 <= cfg.inference_min_batch_size <= cfg.inference_batch_size:
+        raise ValueError("inference_min_batch_size must be within the batch size")
+    if cfg.inference_timeout_seconds <= 0:
+        raise ValueError("inference_timeout_seconds must be positive")
+    if cfg.executor == "process" and checkpoint is None:
+        raise ValueError("process self-play requires a checkpoint")
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     metrics = MetricsWriter(output / "metrics.jsonl")
-    evaluator, network_hash, network_mode, batching = _evaluator(checkpoint, cfg)
+    evaluator: Evaluator | None = None
+    batching: BatchingEvaluator | None = None
+    process_executor: ProcessSelfPlayExecutor | None = None
+    process_final_stats: dict[str, Any] | None = None
+    process_model = None
+    if cfg.executor == "process":
+        assert checkpoint is not None
+        loaded = load_checkpoint(checkpoint, device="cpu")
+        network_hash = hashlib.sha256(loaded.weights_path.read_bytes()).hexdigest()
+        network_mode = "checkpoint"
+        process_model = loaded.model
+    else:
+        evaluator, network_hash, network_mode, batching = _evaluator(checkpoint, cfg)
     manifest_path = output / "manifest.json"
     existing_shards = sorted(output.glob("replay-*.npz"))
     previous_games = 0
@@ -230,11 +262,75 @@ def run_selfplay(
     elif existing_shards:
         raise ValueError("replay shards exist without manifest; refusing an ambiguous resume")
 
-    shard_samples: list[ReplaySample] = []
+    if process_model is not None:
+        process_executor = ProcessSelfPlayExecutor(
+            process_model,
+            ProcessRuntimeConfig(
+                actors=cfg.actors,
+                max_batch_size=cfg.inference_batch_size,
+                min_batch_size=cfg.inference_min_batch_size,
+                wait_ms=cfg.inference_wait_ms,
+                timeout_seconds=cfg.inference_timeout_seconds,
+                device=cfg.device,
+                precision=cfg.precision,
+                channels_last=cfg.channels_last,
+            ),
+            simulations=cfg.simulations,
+            sample_until_ply=cfg.sample_until_ply,
+            max_ply=cfg.max_ply,
+            seed=cfg.seed,
+            first_game_index=previous_games,
+        )
+
+    shard_batches: list[PackedReplayBatch] = []
     shard_game_count = 0
     invocation_positions = 0
     completed_games = 0
     started = time.perf_counter()
+    runtime_path = output / "runtime.json"
+    last_runtime_write = 0.0
+    writer_seconds = 0.0
+    actor_cpu_seconds = 0.0
+    feature_encoding_seconds = 0.0
+    actor_inference_wait_seconds = 0.0
+    search_and_rules_seconds = 0.0
+    replay_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chessai-replay-writer")
+    pending_write: Future[tuple[dict[str, Any], float]] | None = None
+
+    def inference_stats() -> dict[str, Any]:
+        if process_final_stats is not None:
+            return process_final_stats
+        if process_executor is not None:
+            return process_executor.stats()
+        if batching is not None:
+            return batching.stats()
+        return {"mode": "synchronous"}
+
+    def persist_runtime(*, force: bool = False) -> None:
+        nonlocal last_runtime_write
+        now = time.monotonic()
+        if not force and now - last_runtime_write < 10.0:
+            return
+        elapsed = max(time.perf_counter() - started, 1e-9)
+        write_json_atomic(
+            runtime_path,
+            {
+                "kind": "selfplay-runtime-v1",
+                "executor": cfg.executor,
+                "actors": cfg.actors,
+                "completed_games": completed_games,
+                "completed_positions": invocation_positions,
+                "elapsed_seconds": elapsed,
+                "positions_per_second": invocation_positions / elapsed,
+                "replay_write_seconds": writer_seconds,
+                "actor_cpu_seconds": actor_cpu_seconds,
+                "feature_encoding_seconds": feature_encoding_seconds,
+                "actor_inference_wait_seconds": actor_inference_wait_seconds,
+                "search_and_rules_seconds": search_and_rules_seconds,
+                "inference": inference_stats(),
+            },
+        )
+        last_runtime_write = now
 
     def persist_progress() -> dict[str, Any]:
         elapsed = previous_elapsed + time.perf_counter() - started
@@ -258,39 +354,90 @@ def run_selfplay(
                 "next_seed": cfg.seed + cumulative_games,
                 "next_shard_index": len(shards),
             },
-            "inference": batching.stats() if batching is not None else {"mode": "synchronous"},
+            "inference": inference_stats(),
+            "runtime": {
+                "executor": cfg.executor,
+                "actors": cfg.actors,
+                "inference_batch_size": cfg.inference_batch_size,
+                "inference_min_batch_size": cfg.inference_min_batch_size,
+                "inference_wait_ms": cfg.inference_wait_ms,
+                "inference_timeout_seconds": cfg.inference_timeout_seconds,
+                "channels_last": cfg.channels_last,
+                "replay_write_seconds": writer_seconds,
+                "actor_cpu_seconds": actor_cpu_seconds,
+                "feature_encoding_seconds": feature_encoding_seconds,
+                "actor_inference_wait_seconds": actor_inference_wait_seconds,
+                "search_and_rules_seconds": search_and_rules_seconds,
+            },
             "shards": shards,
         }
         write_json_atomic(manifest_path, current)
         return current
 
     def flush_shard() -> None:
-        nonlocal shard_samples, shard_game_count
-        if not shard_samples:
+        nonlocal pending_write, shard_batches, shard_game_count
+        if not shard_batches:
             return
         shard_path = output / f"replay-{len(shards):06d}.npz"
         absolute_last_game = previous_games + completed_games - 1
-        shard = save_replay_shard(
-            shard_path,
-            shard_samples,
-            network_hash=network_hash,
-            simulations=cfg.simulations,
-            seed=cfg.seed + absolute_last_game - shard_game_count + 1,
-            games=shard_game_count,
-        )
-        shards.append(shard)
-        shard_samples = []
+        packed = combine_packed_replay(shard_batches)
+        first_seed = cfg.seed + absolute_last_game - shard_game_count + 1
+        games_in_shard = shard_game_count
+
+        def write() -> tuple[dict[str, Any], float]:
+            write_started = time.perf_counter()
+            shard = save_packed_replay_shard(
+                shard_path,
+                packed,
+                network_hash=network_hash,
+                simulations=cfg.simulations,
+                seed=first_seed,
+                games=games_in_shard,
+            )
+            return shard, time.perf_counter() - write_started
+
+        pending_write = replay_writer.submit(write)
+        shard_batches = []
         shard_game_count = 0
+
+    def finalize_pending_write() -> None:
+        nonlocal pending_write, writer_seconds
+        if pending_write is None:
+            return
+        shard, elapsed = pending_write.result()
+        shards.append(shard)
+        writer_seconds += elapsed
+        pending_write = None
         persist_progress()
 
-    def record_game(generated: tuple[list[ReplaySample], dict[str, Any]]) -> None:
-        nonlocal shard_game_count, invocation_positions, completed_games
-        samples, game_summary = generated
+    def record_game(
+        generated: tuple[list[ReplaySample] | PackedReplayBatch, dict[str, Any]]
+    ) -> None:
+        nonlocal actor_cpu_seconds
+        nonlocal actor_inference_wait_seconds
+        nonlocal completed_games
+        nonlocal feature_encoding_seconds
+        nonlocal invocation_positions
+        nonlocal search_and_rules_seconds
+        nonlocal shard_game_count
+        finalize_pending_write()
+        samples_or_packed, game_summary = generated
+        packed = (
+            samples_or_packed
+            if isinstance(samples_or_packed, PackedReplayBatch)
+            else pack_replay_samples(samples_or_packed)
+        )
         absolute_game_index = previous_games + completed_games
-        shard_samples.extend(samples)
+        shard_batches.append(packed)
         shard_game_count += 1
-        invocation_positions += len(samples)
+        invocation_positions += packed.positions
         completed_games += 1
+        actor_cpu_seconds += float(game_summary.get("actor_cpu_seconds", 0.0))
+        feature_encoding_seconds += float(game_summary.get("feature_encoding_seconds", 0.0))
+        actor_inference_wait_seconds += float(
+            game_summary.get("inference_wait_seconds", 0.0)
+        )
+        search_and_rules_seconds += float(game_summary.get("search_and_rules_seconds", 0.0))
         metrics.write("selfplay_game", game=absolute_game_index, **game_summary)
         if shard_game_count >= cfg.shard_games:
             flush_shard()
@@ -301,8 +448,30 @@ def run_selfplay(
         assert cfg.games is not None
         return completed_games < cfg.games
 
+    monitor_stop = threading.Event()
+
+    def monitor_runtime() -> None:
+        while not monitor_stop.wait(10.0):
+            persist_runtime(force=True)
+
+    monitor = threading.Thread(
+        target=monitor_runtime,
+        name="chessai-selfplay-runtime",
+        daemon=True,
+    )
+    persist_runtime(force=True)
+    monitor.start()
     try:
-        if cfg.actors > 1:
+        if process_executor is not None:
+            game_limit = cfg.games
+            for process_result in process_executor.games(
+                game_limit=game_limit,
+                target_positions=cfg.target_positions,
+                previous_positions=previous_positions,
+            ):
+                record_game((process_result.replay, process_result.summary))
+        elif cfg.actors > 1:
+            assert evaluator is not None
             with ThreadPoolExecutor(
                 max_workers=cfg.actors,
                 thread_name_prefix="chessai-selfplay",
@@ -321,9 +490,10 @@ def run_selfplay(
                         )
                         for offset in range(batch_size)
                     ]
-                    for generated in executor.map(_play_job, jobs):
-                        record_game(generated)
+                    for thread_result in executor.map(_play_job, jobs):
+                        record_game(thread_result)
         else:
+            assert evaluator is not None
             while needs_more():
                 job = (
                     evaluator,
@@ -334,9 +504,24 @@ def run_selfplay(
                 )
                 record_game(_play_job(job))
         flush_shard()
+        finalize_pending_write()
     finally:
+        monitor_stop.set()
+        monitor.join(timeout=2.0)
+        writer_error: BaseException | None = None
+        try:
+            finalize_pending_write()
+        except BaseException as exc:
+            writer_error = exc
+        replay_writer.shutdown(wait=True, cancel_futures=False)
+        persist_runtime(force=True)
+        if process_executor is not None:
+            process_final_stats = process_executor.stats()
+            process_executor.close()
         if batching is not None:
             batching.close()
+        if writer_error is not None:
+            raise writer_error
 
     invocation_elapsed = time.perf_counter() - started
     manifest = persist_progress()

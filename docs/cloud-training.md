@@ -1,7 +1,7 @@
 # ChessAI RTX 5090 云端训练与模型回传操作手册
 
 本文档用于把 `E:\AI_project\ChessAI` 迁移到云端 RTX 5090 服务器，完成
-CCPD 监督预热和 500,000 个自博弈局面的产品版训练，再把最佳模型下载回
+CCPD 监督预热和至少 150,000 个自博弈局面的产品版训练，再把最佳模型下载回
 Windows 本地进行推理和网页人机对弈。
 
 本文所有命令都以当前项目接口为准。正式训练不使用 Docker，也不会在云端重新
@@ -13,10 +13,11 @@ Windows 本地进行推理和网页人机对弈。
 - 第 3 节：推荐的 GitHub 源码同步 + CCPD 单独上传；
 - 第 4 节：不使用 GitHub 的直接文件上传方案；
 - 第 5–7 节：Python 环境、native 后端、doctor 和 tiny 门禁；
-- 第 8–9 节：正式训练与断点恢复；
-- 第 10–11 节：观察进度并判断模型是否训练好；
-- 第 12–14 节：导出、下载并在本地推理；
-- 第 15–16 节：后续同步、备份与故障排查。
+- 第 8 节：5090 性能 pilot；
+- 第 9–11 节：正式训练、旧运行升级与普通恢复；
+- 第 12–13 节：观察进度并判断模型是否训练好；
+- 第 14–16 节：导出、下载并在本地推理；
+- 第 17–18 节：后续同步、备份与故障排查。
 
 ## 1. 云端资源和目录要求
 
@@ -86,39 +87,24 @@ Windows `.pyd`，这些内容在 Ubuntu 上不能复用。
 
 ## 3. 推荐方案：GitHub 同步代码，单独上传数据
 
-### 3.1 首次把本地代码发布到 GitHub
+### 3.1 确认本地代码已同步到 GitHub
 
-当前本地仓库已经初始化，但尚无首个 Git 提交，也没有配置远端地址。因此第一次
-不能直接在云端 `git clone`，要先在 GitHub 创建一个空仓库。
+项目已经发布到 `https://github.com/js6288/ChessAI`。源代码优先通过 GitHub
+同步；数据、replay 和 checkpoint 仍按本节说明单独传输。
 
-建议创建私有仓库。不要在 GitHub 网页端勾选自动生成 README、许可证或
-`.gitignore`，因为本地已经存在这些文件。
-
-在 Windows PowerShell 中执行：
+在 Windows PowerShell 中确认工作区、远端和提交，然后推送最新版本：
 
 ```powershell
 Set-Location E:\AI_project\ChessAI
 
 git status --short
-git add -- .editorconfig .env.example .github .gitignore `
-  ATTRIBUTION.md LICENSE README.md configs docs native `
-  pyproject.toml src tests uv.lock web
-git diff --cached --check
-git commit -m "Initial playable Xiangqi AI"
-git branch -M main
-git remote add origin git@github.com:js6288/ChessAI.git
-git push -u origin main
+git remote -v
+git log -1 --oneline
+git push origin main
 ```
 
-如果使用 HTTPS，把远端替换为：
-
-```powershell
-git remote add origin https://github.com/js6288/ChessAI.git
-```
-
-私有仓库推荐使用 SSH key 或 GitHub 的认证管理流程，不要把访问令牌直接写进脚本、
-README 或命令历史。提交前再次检查，确保 `data/`、`runs/`、`checkpoints/`、
-`.venv/` 和任何密钥没有进入暂存区：
+不要把访问令牌直接写进脚本、README 或命令历史。推送前确认 `data/`、`runs/`、
+`checkpoints/`、`.venv/` 和任何密钥没有进入提交：
 
 ```powershell
 git status --short
@@ -425,7 +411,42 @@ chessai train playable data/processed/ccpd \
   --resume
 ```
 
-## 8. 启动正式 500,000 局面训练
+## 8. 先运行 5,000 局面性能 pilot
+
+多进程版本必须先用现有监督模型做独立 pilot；该命令使用系统临时目录保存 replay，
+结束后只留下 JSON 报告，不会修改 `runs/playable`：
+
+```bash
+chessai benchmark selfplay checkpoints/best \
+  --positions 5000 \
+  --simulations 16 \
+  --actors 48 \
+  --output artifacts/selfplay-benchmark.json
+```
+
+查看关键结果：
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+r = json.loads(Path("artifacts/selfplay-benchmark.json").read_text())
+print("positions/s:", r["positions_per_second"])
+print("games/s:", r["games_per_second"])
+print("mean batch:", r["inference"].get("mean_batch_size"))
+print("largest batch:", r["inference"].get("largest_batch"))
+print("request p95 ms:", r["inference"].get("request_ms_p95"))
+print("CUDA peak GiB:", r["cuda_peak_memory_bytes"] / 2**30)
+print("failures:", r["failures"])
+PY
+```
+
+与升级前留存的旧 manifest 在相同 checkpoint、16 simulations 和 max ply 下比较。
+新吞吐必须至少达到旧实现的 5 倍，并且 mean batch 至少 16、largest batch 至少 32、
+无 worker crash/timeout/NaN/非法着，才启动正式训练。显存占用不是门禁。
+
+## 9. 启动正式 150,000 局面训练
 
 建议在 `tmux` 中运行，避免 SSH 断开导致前台进程退出。若镜像没有 `tmux`，先按
 平台允许的方式安装，或使用平台自带的持久终端。
@@ -467,13 +488,51 @@ tmux attach -t chessai-train
 
 1. 完整 24,878 盘训练集监督预热 1 epoch；
 2. 完整验证集和测试集评估；
-3. 第 1–2 轮各生成约 100,000 个局面，16 simulations；
-4. 第 3–5 轮各生成约 100,000 个局面，32 simulations；
+3. 第 1–2 轮各生成至少 50,000 个局面，16 simulations；
+4. 第 3 轮生成至少 50,000 个局面，32 simulations；
 5. 每轮从最近最多 300,000 个 replay 局面训练 1 epoch；
 6. 每轮进行 20 盘 candidate 对 `best` 快速对局；
 7. 训练结束后进行 20 盘 `best` 对 Random 的可玩性检查。
 
-## 9. 中断后恢复训练
+## 10. 从旧线程版第一轮升级并恢复
+
+当前云端已经完成监督预热、正在旧版第一轮 self-play 时，按以下顺序操作。先在训练
+终端按一次 `Ctrl+C` 并等待进程完全退出；旧进程仍运行时不得 `git pull`。
+
+```bash
+cd /root/autodl-tmp/ChessAI
+cp runs/playable/state.json artifacts/state-before-process-upgrade.json
+cp runs/playable/iteration-001/selfplay/manifest.json \
+  artifacts/selfplay-thread-baseline.json
+git pull --ff-only
+source .venv/bin/activate
+uv pip install -e ".[dev,native]"
+
+cmake -S native -B native/build-linux -G Ninja \
+  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+  -DPython_EXECUTABLE="$(command -v python)" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build native/build-linux --config Release
+```
+
+依次重跑 doctor、perft、测试和第 8 节 benchmark。pilot 达标后，只在这一次执行：
+
+```bash
+chessai train playable data/processed/ccpd \
+  --output runs/playable \
+  --model-dir checkpoints \
+  --config configs/playable.yaml \
+  --resume \
+  --restart-current-selfplay \
+  2>&1 | tee -a artifacts/playable-console.log
+```
+
+它会创建 `runs/playable/state.v1.backup.json`，把旧的部分第一轮原子移动到
+`runs/playable/abandoned/`，保留 `bootstrap_positions` 和 `checkpoints/best`，然后按
+新预算从第一轮 0 个 RL 局面开始。确认新目录已产生完整 shard 且 `runtime.json`
+持续更新后，以后的恢复不得再带 `--restart-current-selfplay`。
+
+## 11. 普通中断后恢复训练
 
 如果服务器重启、SSH 断线或进程被中断，先确认数据盘仍挂载，然后使用原来的
 数据、输出、模型和配置路径：
@@ -495,7 +554,9 @@ chessai train playable data/processed/ccpd \
   2>&1 | tee -a artifacts/playable-console.log
 ```
 
-恢复时不要：
+v2 状态允许修改 actor 数、推理批次、等待/超时和 channels-last 等运行时参数；
+模型、规则、特征、随机种子、3×50K 预算和 `[16,16,32]` schedule 等训练语义不能
+修改。恢复时不要：
 
 - 改动 `configs/playable.yaml`；
 - 移动或重命名 `runs/playable`；
@@ -507,7 +568,7 @@ chessai train playable data/processed/ccpd \
 恢复会重新验证数据、配置、replay manifest、replay shard 和 checkpoint 散列。
 如果提示 hash mismatch，应先查明文件是否传输不完整或被手工修改，不要绕过检查。
 
-## 10. 观察训练进度和机器状态
+## 12. 观察训练进度和机器状态
 
 ### 10.1 GPU、CPU 和磁盘
 
@@ -545,7 +606,7 @@ GPU 长时间为 0%、self-play manifest 的 positions 也不再增长，则需�
 
 ```bash
 cd "$CHESSAI_ROOT"
-python -m json.tool runs/playable/state.json | less
+python -m json.tool runs/playable/state.json
 ```
 
 也可以只打印关键字段：
@@ -573,11 +634,14 @@ PY
 不断更新的 manifest。例如第一轮：
 
 ```bash
-python -m json.tool runs/playable/iteration-001/selfplay/manifest.json | less
+python -m json.tool runs/playable/iteration-001/selfplay/manifest.json
+python -m json.tool runs/playable/iteration-001/selfplay/runtime.json
 tail -f runs/playable/iteration-001/selfplay/metrics.jsonl
 ```
 
-后续轮次将 `001` 替换为 `002` 至 `005`。
+`runtime.json` 每 10 秒原子更新，可查看进程存活数、在途棋局、即时 positions/s、
+mean/p50/p95 batch、请求延迟、特征编码和规则/搜索耗时。后续轮次将 `001` 替换为
+`002` 或 `003`。
 
 ### 10.3 查看监督和 RL 指标
 
@@ -604,7 +668,7 @@ tail -n 20 runs/playable/iteration-001/rl/metrics.jsonl
 
 loss 下降只能说明优化过程在工作，不能单独证明模型棋力已经训练好。
 
-## 11. 如何判断模型是否训练好
+## 13. 如何判断模型是否训练好
 
 ### 11.1 先判断训练是否完整结束
 
@@ -616,14 +680,14 @@ python -m json.tool runs/playable/state.json
 
 完整运行的关键条件是：
 
-- `iteration` 等于 5；
-- `rl_generated_positions` 至少为 500,000；
+- `iteration` 等于 3；
+- `rl_generated_positions` 至少为 150,000；
 - `candidate_checkpoint` 为 `null`；
 - `active_checkpoint` 指向 `checkpoints/best`；
-- `completed_steps` 包含 bootstrap、5 轮 selfplay/RL/arena 和 final-evaluation；
+- `completed_steps` 包含 bootstrap、3 轮 selfplay/RL/arena 和 final-evaluation；
 - `checkpoints/best/metadata.json` 与 `weights.safetensors` 存在。
 
-由于 actor 按批完成棋局，累计局面数可能略高于 500,000，这是正常的受控超出。
+由于 actor 按批完成棋局，累计局面数可能略高于 150,000，这是正常的受控超出。
 
 ### 11.2 再判断基础可玩性是否通过
 
@@ -671,7 +735,7 @@ PY
 ```
 
 candidate 得分率不低于 50% 才会替换 `best`。如果多轮全部被拒绝，最终模型可能
-仍接近监督预热模型；即使训练生成了 500,000 个局面，也不能据此声称 RL 有效。
+仍接近监督预热模型；即使训练生成了 150,000 个局面，也不能据此声称 RL 有效。
 
 ### 11.4 独立重跑一次 Random 检查
 
@@ -702,7 +766,7 @@ chessai evaluate \
 产品版“训练好”的最低定义是规则正确、能稳定完成对局、最终 Random 门禁通过。
 它不代表大师级，也不代表已经达到专业象棋引擎水平。
 
-## 12. 导出云端最佳模型
+## 14. 导出云端最佳模型
 
 不要直接只下载一个裸 `weights.safetensors`，因为本地还需要模型结构、规则版本、
 117 平面版本和 2,086 动作词表散列。使用项目导出命令生成完整推理包：
@@ -766,7 +830,7 @@ ls -lh /root/autodl-fs/ChessAI-backup
 较慢的 `/root/autodl-fs`。在关闭或释放云端实例前，确认模型已经下载到本地，或
 至少存在于 `/root/autodl-fs/ChessAI-backup`。
 
-## 13. 把模型下载回 Windows 本地
+## 15. 把模型下载回 Windows 本地
 
 ### 13.1 使用云平台网页下载
 
@@ -810,7 +874,7 @@ Get-FileHash -Algorithm SHA256 .\chessai-best.tar.gz
 
 两边 SHA-256 必须完全相同。不同则重新下载，不要加载不完整的权重。
 
-## 14. 在本地安装模型并推理
+## 16. 在本地安装模型并推理
 
 ### 14.1 解压到本地 checkpoints
 
@@ -895,7 +959,7 @@ http://127.0.0.1:8000
 推理和标准档对弈，但 128/256 simulations 可能明显更慢；先使用 8 或 32
 simulations 验证完整对局。
 
-## 15. 后续代码同步与模型备份
+## 17. 后续代码同步与模型备份
 
 使用 GitHub 方案时，后续正常流程是：
 
@@ -928,7 +992,7 @@ git pull --ff-only
 只进行本地推理时，完整的 `chessai-best.tar.gz` 推理包已经足够；不必下载数十万
 局面的 replay，也不必下载 `rollback` 或优化器状态。
 
-## 16. 常见问题排查
+## 18. 常见问题排查
 
 ### doctor 显示 `ready_for_playable_training: false`
 

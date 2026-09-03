@@ -32,6 +32,22 @@ class ReplaySample:
 
 
 @dataclass(frozen=True, slots=True)
+class PackedReplayBatch:
+    """Compact, pickle-friendly replay payload used between actor processes."""
+
+    packed_features: np.ndarray
+    halfmove: np.ndarray
+    policy_offsets: np.ndarray
+    action_ids: np.ndarray
+    probabilities: np.ndarray
+    values: np.ndarray
+
+    @property
+    def positions(self) -> int:
+        return int(self.values.shape[0])
+
+
+@dataclass(frozen=True, slots=True)
 class ShardMetadata:
     schema_version: str
     rule_version: str
@@ -59,6 +75,50 @@ def _unpack_features(packed: np.ndarray, halfmove: np.ndarray) -> npt.NDArray[np
     features[:, :116] = binary.reshape(packed.shape[0], 116, 10, 9)
     features[:, 116] = halfmove.astype(np.float32)[:, None, None]
     return features
+
+
+def pack_replay_samples(samples: Sequence[ReplaySample]) -> PackedReplayBatch:
+    if not samples:
+        raise ValueError("cannot pack empty replay samples")
+    features = np.stack([sample.features for sample in samples]).astype(np.float32)
+    packed, halfmove = _pack_features(features)
+    offsets = [0]
+    action_parts: list[np.ndarray] = []
+    probability_parts: list[np.ndarray] = []
+    for sample in samples:
+        if sample.action_ids.size == 0 or sample.action_ids.shape != sample.probabilities.shape:
+            raise ValueError("each replay sample needs matching non-empty sparse policy arrays")
+        probability_sum = float(sample.probabilities.sum())
+        if not np.isfinite(probability_sum) or probability_sum <= 0:
+            raise ValueError("replay policy probabilities must have a finite positive sum")
+        action_parts.append(sample.action_ids.astype(np.uint16, copy=False))
+        probability_parts.append((sample.probabilities / probability_sum).astype(np.float16))
+        offsets.append(offsets[-1] + sample.action_ids.size)
+    return PackedReplayBatch(
+        packed_features=packed,
+        halfmove=halfmove,
+        policy_offsets=np.asarray(offsets, dtype=np.int64),
+        action_ids=np.concatenate(action_parts),
+        probabilities=np.concatenate(probability_parts),
+        values=np.asarray([sample.value for sample in samples], dtype=np.int8),
+    )
+
+
+def combine_packed_replay(batches: Sequence[PackedReplayBatch]) -> PackedReplayBatch:
+    if not batches:
+        raise ValueError("cannot combine empty packed replay batches")
+    offsets = [0]
+    for batch in batches:
+        base = offsets[-1]
+        offsets.extend((batch.policy_offsets[1:] + base).tolist())
+    return PackedReplayBatch(
+        packed_features=np.concatenate([batch.packed_features for batch in batches], axis=0),
+        halfmove=np.concatenate([batch.halfmove for batch in batches], axis=0),
+        policy_offsets=np.asarray(offsets, dtype=np.int64),
+        action_ids=np.concatenate([batch.action_ids for batch in batches]),
+        probabilities=np.concatenate([batch.probabilities for batch in batches]),
+        values=np.concatenate([batch.values for batch in batches]),
+    )
 
 
 def read_replay_metadata(path: str | Path) -> dict[str, Any]:
@@ -92,26 +152,31 @@ def save_replay_shard(
     seed: int,
     games: int,
 ) -> dict[str, Any]:
-    if not samples:
+    return save_packed_replay_shard(
+        path,
+        pack_replay_samples(samples),
+        network_hash=network_hash,
+        simulations=simulations,
+        seed=seed,
+        games=games,
+    )
+
+
+def save_packed_replay_shard(
+    path: str | Path,
+    packed: PackedReplayBatch,
+    *,
+    network_hash: str,
+    simulations: int,
+    seed: int,
+    games: int,
+) -> dict[str, Any]:
+    if packed.positions <= 0:
         raise ValueError("cannot save an empty replay shard")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise FileExistsError(f"refusing to overwrite replay shard: {target}")
-    features = np.stack([sample.features for sample in samples]).astype(np.float32)
-    packed, halfmove = _pack_features(features)
-    offsets = [0]
-    action_parts: list[np.ndarray] = []
-    probability_parts: list[np.ndarray] = []
-    for sample in samples:
-        if sample.action_ids.size == 0 or sample.action_ids.shape != sample.probabilities.shape:
-            raise ValueError("each replay sample needs matching non-empty sparse policy arrays")
-        probability_sum = float(sample.probabilities.sum())
-        if not np.isfinite(probability_sum) or probability_sum <= 0:
-            raise ValueError("replay policy probabilities must have a finite positive sum")
-        action_parts.append(sample.action_ids.astype(np.uint16))
-        probability_parts.append((sample.probabilities / probability_sum).astype(np.float16))
-        offsets.append(offsets[-1] + sample.action_ids.size)
     metadata = ShardMetadata(
         schema_version=SCHEMA_VERSION,
         rule_version=RULE_VERSION,
@@ -121,17 +186,17 @@ def save_replay_shard(
         simulations=simulations,
         seed=seed,
         games=games,
-        positions=len(samples),
+        positions=packed.positions,
     )
     temporary = target.with_name(target.name + ".tmp.npz")
     np.savez_compressed(
         temporary,
-        packed_features=packed,
-        halfmove=halfmove,
-        policy_offsets=np.asarray(offsets, dtype=np.int64),
-        action_ids=np.concatenate(action_parts),
-        probabilities=np.concatenate(probability_parts),
-        values=np.asarray([sample.value for sample in samples], dtype=np.int8),
+        packed_features=packed.packed_features,
+        halfmove=packed.halfmove,
+        policy_offsets=packed.policy_offsets,
+        action_ids=packed.action_ids,
+        probabilities=packed.probabilities,
+        values=packed.values,
         metadata=np.asarray(json.dumps(asdict(metadata), sort_keys=True)),
     )
     if target.exists():  # Defend against a concurrent writer after preparation.

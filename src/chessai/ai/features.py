@@ -7,7 +7,7 @@ from collections.abc import Sequence
 import numpy as np
 import numpy.typing as npt
 
-from chessai.engine import Color, GameState, Move, Square
+from chessai.engine import Color, GameState, Move
 from chessai.engine.board import EMPTY, NO_CAPTURE_DRAW_PLIES
 from chessai.engine.vocabulary import action_labels, encode_move
 
@@ -16,19 +16,12 @@ PIECE_PLANES_PER_FRAME = 14
 INPUT_PLANES = 117
 PIECE_ORDER = "KABNRCPkabnrcp"
 PIECE_TO_PLANE = {piece: index for index, piece in enumerate(PIECE_ORDER)}
+_SQUARE_FILES = np.tile(np.arange(9, dtype=np.intp), 10)
+_SQUARE_RANKS = np.repeat(np.arange(10, dtype=np.intp), 9)
+_ROTATED_INDICES = np.arange(89, -1, -1, dtype=np.intp)
 
 FloatArray = npt.NDArray[np.float32]
 BoolArray = npt.NDArray[np.bool_]
-
-
-def _canonical_board(board: tuple[str, ...], side_to_move: Color) -> tuple[str, ...]:
-    if side_to_move is Color.RED:
-        return board
-    rotated = [EMPTY] * 90
-    for index, piece in enumerate(board):
-        target = Square.from_index(index).rotate().index
-        rotated[target] = piece.swapcase() if piece != EMPTY else EMPTY
-    return tuple(rotated)
 
 
 def canonical_move(move: Move, side_to_move: Color) -> Move:
@@ -41,13 +34,18 @@ def encode_state(state: GameState) -> FloatArray:
     features = np.zeros((INPUT_PLANES, 10, 9), dtype=np.float32)
     history = tuple(reversed(state.board_history[-HISTORY_LENGTH:]))
     for history_index, board in enumerate(history):
-        canonical = _canonical_board(board, state.side_to_move)
         plane_offset = history_index * PIECE_PLANES_PER_FRAME
-        for square_index, piece in enumerate(canonical):
+        black_to_move = state.side_to_move is Color.BLACK
+        for square_index, piece in enumerate(board):
             if piece == EMPTY:
                 continue
-            square = Square.from_index(square_index)
-            features[plane_offset + PIECE_TO_PLANE[piece], square.rank, square.file] = 1.0
+            target_index = int(_ROTATED_INDICES[square_index]) if black_to_move else square_index
+            canonical_piece = piece.swapcase() if black_to_move else piece
+            features[
+                plane_offset + PIECE_TO_PLANE[canonical_piece],
+                _SQUARE_RANKS[target_index],
+                _SQUARE_FILES[target_index],
+            ] = 1.0
 
     if state.move_records:
         move = canonical_move(state.move_records[-1].move, state.side_to_move)

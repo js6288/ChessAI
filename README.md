@@ -35,8 +35,12 @@ uv run chessai serve
 ## 一键训练可玩模型
 
 正式训练使用唯一配置 `configs/playable.yaml`：先对完整训练集监督预热
-1 个 epoch，再生成 5 轮、合计约 500,000 个强化学习局面，replay 最多保留
+1 个 epoch，再生成 3 轮、合计至少 150,000 个强化学习局面，replay 最多保留
 最近 300,000 个局面。
+
+正式 self-play 使用 48 个独立 CPU actor、单份 GPU 模型和 16–64 的动态推理
+批次。前两轮各至少 50,000 局面、16 simulations，第三轮至少 50,000 局面、
+32 simulations。
 
 ```bash
 chessai train playable data/processed/ccpd \

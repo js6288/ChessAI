@@ -84,3 +84,28 @@ def test_max_ply_draw_is_an_explicit_safety_guard() -> None:
     )
     assert state.outcome().status is GameStatus.DRAW
     assert state.outcome().reason == "max_ply_limit"
+
+
+def test_repetition_annotations_are_lazy_and_match_eager_oracle() -> None:
+    moves = ("b0c2", "b9c7", "c2b0", "c7b9") * 2
+    lazy = GameState.initial()
+    eager_records = []
+    for move in moves:
+        lazy = lazy.apply(move)
+        index = len(lazy.move_records) - 1
+        eager_records.append(lazy._annotate_record(index, lazy.move_records[-1]))
+
+    assert all(record.gave_check is None for record in lazy.move_records)
+    eager = GameState(
+        board=lazy.board,
+        side_to_move=lazy.side_to_move,
+        halfmove_clock=lazy.halfmove_clock,
+        fullmove_number=lazy.fullmove_number,
+        ply=lazy.ply,
+        position_history=lazy.position_history,
+        board_history=lazy.board_history,
+        move_records=tuple(eager_records),
+        max_ply=lazy.max_ply,
+    )
+    assert lazy.outcome() == eager.outcome()
+    assert lazy.outcome().reason == "threefold_repetition"
