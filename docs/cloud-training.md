@@ -603,7 +603,7 @@ v2 状态允许修改 actor 数、推理批次、等待/超时和 channels-last 
 
 ## 12. 观察训练进度和机器状态
 
-### 10.1 GPU、CPU 和磁盘
+### 12.1 GPU、CPU 和磁盘
 
 另开一个 SSH 会话执行：
 
@@ -635,7 +635,7 @@ du -sh data runs checkpoints artifacts .venv 2>/dev/null
 GPU 长时间为 0%、self-play manifest 的 positions 也不再增长，则需要检查进程和
 日志。磁盘低于 25 GB 时应暂停排查，不要删除当前状态清单仍引用的 replay。
 
-### 10.2 查看总状态
+### 12.2 查看总状态
 
 ```bash
 cd "$CHESSAI_ROOT"
@@ -676,7 +676,109 @@ tail -f runs/playable/iteration-001/selfplay/metrics.jsonl
 mean/p50/p95 batch、请求延迟、特征编码和规则/搜索耗时。后续轮次将 `001` 替换为
 `002` 或 `003`。
 
-### 10.3 查看监督和 RL 指标
+### 12.3 自动显示当前 self-play 百分比、吞吐和 ETA
+
+下面的命令会根据顶层状态自动定位当前轮次，无需手工把路径中的 `001` 改成
+`002` 或 `003`。它显示已原子提交的局面数、50,000 目标、完成百分比、本次进程
+即时吞吐、预计剩余时间、Actor 存活数、在途棋局和 GPU 推理 batch：
+
+```bash
+cd /root/autodl-tmp/ChessAI
+
+selfplay_progress() {
+python - <<'PY'
+import json
+from pathlib import Path
+
+run = Path("runs/playable")
+state = json.loads((run / "state.json").read_text(encoding="utf-8"))
+
+if state["stage"] != "selfplay":
+    print(f"当前不是 self-play 阶段: stage={state['stage']!r}")
+    print(f"已完成 RL 局面: {state['rl_generated_positions']:,}")
+    raise SystemExit(0)
+
+iteration = int(state["iteration"]) + 1
+selfplay = run / f"iteration-{iteration:03d}" / "selfplay"
+runtime_path = selfplay / "runtime.json"
+manifest_path = selfplay / "manifest.json"
+
+runtime = (
+    json.loads(runtime_path.read_text(encoding="utf-8"))
+    if runtime_path.is_file()
+    else {}
+)
+manifest = (
+    json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest_path.is_file()
+    else {}
+)
+
+target = int(state["config"]["positions_per_iteration"])
+committed = int(manifest.get("positions", runtime.get("completed_positions", 0)))
+invocation = int(runtime.get("completed_positions", 0))
+rate = float(runtime.get("positions_per_second", 0.0))
+remaining = max(0, target - committed)
+eta_seconds = remaining / rate if rate > 0 else None
+inference = runtime.get("inference", {})
+heartbeat = inference.get("actor_heartbeat_age_seconds", [])
+
+def duration(seconds):
+    if seconds is None:
+        return "暂不可计算"
+    seconds = int(seconds)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+print(f"当前阶段          : selfplay")
+print(f"当前轮次          : {iteration}/3")
+print(f"本轮搜索次数      : {state['config']['simulation_schedule'][iteration - 1]}")
+print(f"已提交/目标局面   : {committed:,}/{target:,}")
+print(f"完成百分比        : {min(100.0, committed / target * 100):.2f}%")
+print(f"本次启动完成局面  : {invocation:,}")
+print(f"即时吞吐          : {rate:.2f} positions/s")
+print(f"预计剩余时间      : {duration(eta_seconds)}")
+print(f"已完成棋局        : {runtime.get('completed_games', 0)}")
+print(
+    "Actor 存活/总数  : "
+    f"{inference.get('actors_alive', 0)}/{runtime.get('actors', 0)}"
+)
+print(f"在途棋局          : {inference.get('inflight_games', 0)}")
+print(f"推理 requests     : {inference.get('requests', 0)}")
+print(f"推理 batches      : {inference.get('batches', 0)}")
+print(f"平均 batch        : {inference.get('mean_batch_size', 0):.2f}")
+print(f"p95 batch         : {inference.get('batch_size_p95', 0):.2f}")
+print(f"最大 batch        : {inference.get('largest_batch', 0)}")
+print(f"请求 p95          : {inference.get('request_ms_p95', 0):.2f} ms")
+if heartbeat:
+    print(f"最久 Actor 心跳   : {max(heartbeat):.1f} s")
+print(f"状态目录          : {selfplay}")
+PY
+}
+
+selfplay_progress
+```
+
+`manifest.json` 的 `positions` 是已经写入完整 replay shard 并原子提交的累计数，最适合
+判断可恢复进度；它最多会落后一个正在写入的 shard。`runtime.json` 中的
+`completed_positions` 是本次进程启动后的计数，恢复训练后会从 0 重新累计，因此
+不能把两者直接相加。ETA 使用当前进程的即时吞吐估算，只作为观察值。
+
+上面的命令同时在当前 shell 中定义了 `selfplay_progress` 函数。若希望每 10 秒自动
+刷新，紧接着执行下面的循环；按 `Ctrl+C` 只会结束监控，不会终止另一个终端或
+tmux 中的正式训练：
+
+```bash
+while true; do
+  clear
+  date '+%F %T'
+  selfplay_progress
+  sleep 10
+done
+```
+
+### 12.4 查看监督和 RL 指标
 
 监督预热：
 
