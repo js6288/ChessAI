@@ -1,0 +1,50 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Frontend
+web/node_modules/
+web/dist/
+web/playwright-report/
+web/test-results/
+output/playwright/
+*.tsbuildinfo
+
+# Large and generated artifacts
+data/raw/
+data/processed/
+data/cache/
+runs/
+checkpoints/
+artifacts/
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.npz
+
+# Native builds
+native/build*/
+*.pyd
+*.so
+*.dll
+*.pdb
+*.ilk
+
+# Local configuration
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

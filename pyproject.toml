@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chessai-xiangqi"
+version = "0.1.0"
+description = "A reproducible Gumbel AlphaZero Xiangqi engine with a local web GUI."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { file = "LICENSE" }
+authors = [{ name = "ChessAI contributors" }]
+dependencies = [
+  "fastapi>=0.116,<1",
+  "numpy>=2.2,<3",
+  "pydantic>=2.11,<3",
+  "pyyaml>=6.0,<7",
+  "safetensors>=0.5,<1",
+  "typer>=0.16,<1",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+train = [
+  "torch>=2.7,<3",
+]
+native = [
+  "cmake>=3.30,<5",
+  "ninja>=1.11,<2",
+  "pybind11>=2.13,<4",
+]
+dev = [
+  "httpx>=0.28,<1",
+  "hypothesis>=6.130,<7",
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.26,<1",
+  "pytest-cov>=6.1,<7",
+  "ruff>=0.11,<1",
+  "types-PyYAML>=6.0,<7",
+]
+
+[project.scripts]
+chessai = "chessai.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chessai"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "slow: long-running tests excluded from the default smoke suite",
+  "torch: tests that require PyTorch",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["chessai"]
+warn_unused_ignores = false

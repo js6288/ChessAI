@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen --extra dev --extra train --extra native
+      - name: Build the C++20 rules backend
+        shell: bash
+        run: |
+          pybind11_dir="$(uv run python -m pybind11 --cmakedir)"
+          python_exe="$(uv run python -c 'import sys; print(sys.executable)')"
+          uv run cmake -S native -B native/build-ci -G Ninja \
+            -Dpybind11_DIR="$pybind11_dir" \
+            -DPython_EXECUTABLE="$python_exe" \
+            -DCMAKE_BUILD_TYPE=Release
+          uv run cmake --build native/build-ci --config Release
+      - name: Static checks
+        run: |
+          uv run ruff check src tests
+          uv run mypy src/chessai
+      - name: Tests including 10k native differential positions
+        env:
+          CHESSAI_RULES_BACKEND: auto
+          CHESSAI_NATIVE_DIFF_POSITIONS: "10000"
+        run: uv run pytest
+
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          python-version: "3.12"
+          enable-cache: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: uv sync --frozen --extra train
+      - run: pnpm install --frozen-lockfile
+        working-directory: web
+      - run: pnpm test
+        working-directory: web
+      - run: pnpm build
+        working-directory: web
+      - run: pnpm exec playwright install --with-deps chromium
+        working-directory: web
+      - run: pnpm test:e2e
+        working-directory: web
