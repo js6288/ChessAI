@@ -1,0 +1,58 @@
+# Strength-oriented product profile. This starts a new run because replay made
+# by the legacy raw-visit policy target is intentionally incompatible with the
+# corrected completed-Q search target.
+bootstrap:
+  epochs: 2
+  batch_size: 256
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  value_loss_weight: 1.0
+  num_workers: 8
+  max_games: null
+  max_steps: null
+  device: cuda
+  precision: bf16
+  seed: 20260904
+
+pipeline:
+  iterations: 8
+  positions_per_iteration: 100000
+  simulation_schedule: [32, 32, 48, 48, 64, 64, 64, 64]
+  keep_replay_iterations: 3
+  seed: 20260904
+
+selfplay:
+  executor: process
+  sample_until_ply: 30
+  max_ply: 300
+  shard_games: 16
+  actors: 48
+  inference_batch_size: 64
+  inference_min_batch_size: 16
+  inference_wait_ms: 1.0
+  inference_timeout_seconds: 120
+  device: cuda
+  precision: bf16
+  channels_last: true
+
+rl:
+  batch_size: 256
+  learning_rate: 0.00005
+  weight_decay: 0.0001
+  value_loss_weight: 1.0
+  replay_capacity: 300000
+  epochs: 2
+  max_steps: null
+  device: cuda
+  precision: bf16
+  seed: 20260904
+
+evaluation:
+  arena_games: 40
+  arena_openings: 10
+  arena_simulations: 128
+  max_ply: 300
+  candidate_score_min: 0.5
+  final_games: 40
+  final_score_min: 0.8
+  final_simulations: 128

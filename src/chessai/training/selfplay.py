@@ -16,6 +16,7 @@ import numpy as np
 from chessai.ai.evaluator import BatchingEvaluator, TorchEvaluator
 from chessai.ai.features import encode_state
 from chessai.ai.search import Evaluator, GumbelSearch, HeuristicEvaluator
+from chessai.compat import SEARCH_VERSION
 from chessai.data.manifest import sha256_file, write_json_atomic
 from chessai.engine import Color, GameState
 from chessai.engine.vocabulary import encode_move
@@ -238,6 +239,11 @@ def run_selfplay(
             mismatches.append(
                 f"network_hash: existing={previous.get('network_hash')!r}, requested={network_hash!r}"
             )
+        if previous.get("search_version") != SEARCH_VERSION:
+            mismatches.append(
+                "search_version: "
+                f"existing={previous.get('search_version')!r}, requested={SEARCH_VERSION!r}"
+            )
         if mismatches:
             raise ValueError("cannot resume incompatible self-play run: " + "; ".join(mismatches))
         previous_games = int(previous.get("games", 0))
@@ -316,6 +322,7 @@ def run_selfplay(
             runtime_path,
             {
                 "kind": "selfplay-runtime-v1",
+                "search_version": SEARCH_VERSION,
                 "executor": cfg.executor,
                 "actors": cfg.actors,
                 "completed_games": completed_games,
@@ -340,6 +347,7 @@ def run_selfplay(
         base_config["games"] = None
         current = {
             "kind": "selfplay-run",
+            "search_version": SEARCH_VERSION,
             "base_config": base_config,
             "last_invocation_config": asdict(cfg),
             "network_hash": network_hash,

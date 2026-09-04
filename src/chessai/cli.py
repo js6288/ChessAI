@@ -17,6 +17,7 @@ import yaml
 from chessai.ai.evaluator import TorchEvaluator
 from chessai.ai.model import ModelConfig
 from chessai.ai.search import GumbelSearch
+from chessai.compat import SEARCH_VERSION
 from chessai.data.manifest import sha256_file, write_json_atomic
 from chessai.data.prepare import prepare_ccpd, validate_prepared_dataset
 from chessai.data.source import CCPD_COMMIT, fetch_ccpd
@@ -344,6 +345,7 @@ def benchmark_selfplay(
         peak_memory = int(torch.cuda.max_memory_allocated())
     report = {
         "kind": "selfplay-benchmark-v1",
+        "search_version": SEARCH_VERSION,
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_sha256": manifest["network_hash"],
         "code_commit": commit,

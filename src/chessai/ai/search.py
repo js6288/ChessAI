@@ -148,6 +148,31 @@ def complete_qvalues(
     return completed
 
 
+def completed_q_policy(
+    logits: npt.NDArray[np.floating],
+    qvalues: npt.NDArray[np.floating],
+    visit_counts: npt.NDArray[np.integer],
+    value: float,
+    scale: float,
+) -> FloatArray:
+    """Return the Gumbel AlphaZero improved policy for one node.
+
+    Unvisited actions use the node's network value through Q-value
+    completion.  The caller supplies the visit-dependent sigma scale from
+    the paper, ``(c_visit + max_b N(b)) * c_scale``.
+    """
+
+    policy_logits = np.asarray(logits, dtype=np.float64)
+    q = np.asarray(qvalues, dtype=np.float64)
+    visits = np.asarray(visit_counts)
+    if policy_logits.shape != q.shape or q.shape != visits.shape:
+        raise ValueError("logits, qvalues, and visit_counts must have identical shapes")
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("completed-Q policy scale must be finite and positive")
+    completed = complete_qvalues(q, visits, value)
+    return stable_softmax(policy_logits + scale * completed)
+
+
 class GumbelSearch:
     def __init__(
         self,
@@ -155,7 +180,7 @@ class GumbelSearch:
         *,
         simulations: int = 32,
         max_considered_actions: int = 16,
-        c_visit: float = 1.5,
+        c_visit: float = 50.0,
         c_scale: float = 1.0,
         seed: int = 0,
     ) -> None:
@@ -163,6 +188,10 @@ class GumbelSearch:
             raise ValueError("simulations must be positive")
         if max_considered_actions <= 0:
             raise ValueError("max_considered_actions must be positive")
+        if not math.isfinite(c_visit) or c_visit <= 0.0:
+            raise ValueError("c_visit must be finite and positive")
+        if not math.isfinite(c_scale) or c_scale <= 0.0:
+            raise ValueError("c_scale must be finite and positive")
         self.evaluator = evaluator or HeuristicEvaluator()
         self.simulations = simulations
         self.max_considered_actions = max_considered_actions
@@ -220,17 +249,25 @@ class GumbelSearch:
             self._simulate_forced_root(root, chosen)
             remaining_budget -= 1
 
-        visited_moves = [
-            move for move in moves if move in root.children and root.children[move].visit_count
-        ]
+        visited_moves = [move for move in moves if self._child_visits(root, move) > 0]
         if not visited_moves:
             visited_moves = [chosen]
         counts = np.asarray(
             [root.children[move].visit_count for move in visited_moves], dtype=np.float64
         )
-        target_probabilities = counts / counts.sum()
+        qvalues, all_visits = self._action_statistics(root, moves)
+        target_probabilities = completed_q_policy(
+            legal_logits,
+            qvalues,
+            all_visits,
+            root.network_value,
+            self._q_scale(root),
+        )
         if temperature <= 0:
-            selected = max(visited_moves, key=lambda move: root.children[move].visit_count)
+            # Sequential Halving's surviving action is the search result.  A
+            # visit-count argmax is incorrect when all sampled root actions
+            # receive the same small budget (the common 16-simulation case).
+            selected = chosen
         else:
             scaled = np.power(np.maximum(counts, 1e-12), 1.0 / temperature)
             selection_probabilities = scaled / scaled.sum()
@@ -240,7 +277,7 @@ class GumbelSearch:
 
         policy = {
             str(move): float(probability)
-            for move, probability in zip(visited_moves, target_probabilities, strict=True)
+            for move, probability in zip(moves, target_probabilities, strict=True)
         }
         stats = tuple(
             CandidateStat(
@@ -250,7 +287,9 @@ class GumbelSearch:
                 q_value=-root.children[move].q_value,
             )
             for move in sorted(
-                visited_moves, key=lambda item: root.children[item].visit_count, reverse=True
+                visited_moves,
+                key=lambda item: (root.children[item].visit_count, policy[str(item)]),
+                reverse=True,
             )
         )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -310,27 +349,54 @@ class GumbelSearch:
 
     def _select_interior(self, node: Node) -> Move:
         moves = tuple(node.priors)
-        qvalues = np.asarray(
-            [-node.children[move].q_value if move in node.children else 0.0 for move in moves],
-            dtype=np.float64,
+        qvalues, visits = self._action_statistics(node, moves)
+        logits = np.log(
+            np.maximum(
+                np.asarray([node.priors[move] for move in moves], dtype=np.float64),
+                1e-300,
+            )
         )
-        visits = np.asarray(
-            [node.children[move].visit_count if move in node.children else 0 for move in moves],
-            dtype=np.int64,
+        improved_policy = completed_q_policy(
+            logits,
+            qvalues,
+            visits,
+            node.network_value,
+            self._q_scale(node),
         )
-        completed = complete_qvalues(qvalues, visits, node.network_value)
-        q_min = float(completed.min())
-        q_max = float(completed.max())
-        normalized = (completed - q_min) / (q_max - q_min + 1e-8)
-        priors = np.asarray([node.priors[move] for move in moves], dtype=np.float64)
-        exploration = self.c_visit * priors * math.sqrt(node.visit_count + 1.0) / (visits + 1.0)
-        scores = self.c_scale * normalized + exploration
+        # Eq. 14: visit actions whose current share falls furthest below the
+        # completed-Q improved policy.  The +1 denominator supplies the next
+        # visit being allocated.
+        visit_share = visits.astype(np.float64) / (1.0 + float(visits.sum()))
+        scores = improved_policy - visit_share
         return moves[int(np.argmax(scores))]
 
     def _root_rank(self, root: Node, move: Move, logit: float, gumbel: float) -> float:
         child = root.children.get(move)
         q = -child.q_value if child is not None and child.visit_count else root.network_value
-        return gumbel + logit + self.c_scale * q
+        return gumbel + logit + self._q_scale(root) * q
+
+    @staticmethod
+    def _child_visits(node: Node, move: Move) -> int:
+        child = node.children.get(move)
+        return child.visit_count if child is not None else 0
+
+    @classmethod
+    def _action_statistics(
+        cls, node: Node, moves: tuple[Move, ...]
+    ) -> tuple[FloatArray, npt.NDArray[np.int64]]:
+        visits = np.asarray([cls._child_visits(node, move) for move in moves], dtype=np.int64)
+        qvalues = np.asarray(
+            [
+                -node.children[move].q_value if visits[index] > 0 else 0.0
+                for index, move in enumerate(moves)
+            ],
+            dtype=np.float64,
+        )
+        return qvalues, visits
+
+    def _q_scale(self, node: Node) -> float:
+        max_visits = max((child.visit_count for child in node.children.values()), default=0)
+        return (self.c_visit + max_visits) * self.c_scale
 
     @staticmethod
     def _backup(path: list[Node], leaf_value: float) -> None:

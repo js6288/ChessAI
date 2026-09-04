@@ -32,6 +32,7 @@ def test_sparse_replay_shard_round_trip(tmp_path) -> None:
         path, [sample], network_hash="test", simulations=8, seed=1, games=1
     )
     assert metadata["positions"] == 1
+    assert metadata["search_version"] == "gumbel-completed-q-v2"
     assert read_replay_metadata(path)["network_hash"] == "test"
     shard = ReplayShard(path)
     restored = shard.sample(0)
@@ -46,6 +47,22 @@ def test_sparse_replay_shard_round_trip(tmp_path) -> None:
 
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         save_replay_shard(path, [sample], network_hash="test", simulations=8, seed=1, games=1)
+
+
+def test_replay_rejects_a_different_search_target_version(tmp_path, monkeypatch) -> None:
+    state = GameState.initial()
+    sample = ReplaySample(
+        features=encode_state(state),
+        action_ids=np.asarray([2], dtype=np.uint16),
+        probabilities=np.asarray([1.0], dtype=np.float32),
+        value=0.0,
+    )
+    path = tmp_path / "replay.npz"
+    save_replay_shard(path, [sample], network_hash="test", simulations=8, seed=1, games=1)
+
+    monkeypatch.setattr("chessai.training.replay.SEARCH_VERSION", "future-search")
+    with pytest.raises(ValueError, match="search_version"):
+        read_replay_metadata(path)
 
 
 def test_packed_actor_payload_combines_without_changing_replay(tmp_path) -> None:

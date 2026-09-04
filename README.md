@@ -34,7 +34,7 @@ uv run chessai serve
 
 ## 一键训练可玩模型
 
-正式训练使用唯一配置 `configs/playable.yaml`：先对完整训练集监督预热
+基础产品训练使用 `configs/playable.yaml`：先对完整训练集监督预热
 1 个 epoch，再生成 3 轮、合计至少 150,000 个强化学习局面，replay 最多保留
 最近 300,000 个局面。
 
@@ -72,6 +72,22 @@ chessai train playable data/processed/ccpd \
   --model-dir checkpoints-tiny \
   --tiny
 ```
+
+如果基础模型仍然不够强，请使用独立的 `configs/stronger.yaml`。该配置会监督预热
+2 个 epoch，并执行 8 轮、每轮至少 100,000 个局面的强化学习；搜索预算逐步由
+32 提升到 64 simulations，每轮 RL 训练 2 个 epoch，arena 使用 128 simulations。
+replay 容量仍限制为最近 300,000 个局面，不会无限占用磁盘：
+
+```bash
+chessai train playable data/processed/ccpd \
+  --output runs/stronger-v2 \
+  --model-dir checkpoints-stronger \
+  --config configs/stronger.yaml
+```
+
+搜索目标现已使用 completed-Q 改进策略，并由 Sequential Halving 的最终排名决定
+确定性着法。旧版 raw-visit replay 不兼容修正后的训练目标，因此加强训练必须使用
+新的 run/model 目录，不能用 `--resume` 接在旧 `runs/playable` 后面。
 
 ## 目录
 

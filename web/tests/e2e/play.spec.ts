@@ -5,6 +5,7 @@ test("human can move, undo, flip, and export tools remain available", async ({ p
   await expect(page.getByRole("heading", { name: "人机对弈" })).toBeVisible();
   await expect(page.getByTestId("piece-h2")).toBeVisible();
 
+  await page.getByLabel("对弈模型").selectOption("heuristic");
   await page.getByRole("button", { name: /试锋/ }).click();
   await page.getByRole("button", { name: /另开一局/ }).click();
   await page.getByTestId("piece-h2").click();
@@ -18,6 +19,7 @@ test("human can move, undo, flip, and export tools remain available", async ({ p
 
 test("restart cancels an in-flight AI turn without a ghost move", async ({ page }) => {
   await page.goto("/");
+  await page.getByLabel("对弈模型").selectOption("heuristic");
   await page.getByRole("button", { name: /试锋/ }).click();
   await page.getByRole("button", { name: /另开一局/ }).click();
   await page.getByTestId("piece-h2").click();
@@ -30,6 +32,7 @@ test("restart cancels an in-flight AI turn without a ghost move", async ({ page 
 
 test("game over opens a readable settlement over the board", async ({ page }) => {
   await page.goto("/");
+  await page.getByLabel("对弈模型").selectOption("heuristic");
   await page.getByRole("button", { name: "执黑" }).click();
   await page.getByRole("button", { name: /试锋/ }).click();
   await page.getByRole("button", { name: /另开一局/ }).click();

@@ -12,7 +12,7 @@ import numpy as np
 import numpy.typing as npt
 
 from chessai.ai.features import INPUT_PLANES
-from chessai.compat import FEATURE_VERSION, RULE_VERSION, SCHEMA_VERSION
+from chessai.compat import FEATURE_VERSION, RULE_VERSION, SCHEMA_VERSION, SEARCH_VERSION
 from chessai.data.manifest import sha256_file
 from chessai.engine.vocabulary import action_vocab_hash
 
@@ -52,6 +52,7 @@ class ShardMetadata:
     schema_version: str
     rule_version: str
     feature_version: str
+    search_version: str
     action_vocab_hash: str
     network_hash: str
     simulations: int
@@ -131,6 +132,7 @@ def read_replay_metadata(path: str | Path) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "rule_version": RULE_VERSION,
         "feature_version": FEATURE_VERSION,
+        "search_version": SEARCH_VERSION,
         "action_vocab_hash": action_vocab_hash(),
     }
     mismatches = [
@@ -181,6 +183,7 @@ def save_packed_replay_shard(
         schema_version=SCHEMA_VERSION,
         rule_version=RULE_VERSION,
         feature_version=FEATURE_VERSION,
+        search_version=SEARCH_VERSION,
         action_vocab_hash=action_vocab_hash(),
         network_hash=network_hash,
         simulations=simulations,

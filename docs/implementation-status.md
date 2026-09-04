@@ -7,9 +7,9 @@
 | --- | --- | --- | --- |
 | 规则 | Python 不可变引擎、C++20 热路径、重复/长将/长捉裁决 | perft 44 / 1,920 / 79,666；10,000 个随机可达局面差分通过 | 继续扩充 WXF 长捉边界棋例 |
 | 表示 | 2,086 动作词表、117 平面、版本和散列兼容契约 | 词表、特征和 checkpoint 拒绝测试通过 | 无接口项 |
-| 搜索 | Gumbel top-k、Sequential Halving、Q completion、合法 mask、价值回传 | 人工小树和象棋搜索测试通过 | 正式模型的吞吐和响应时间 |
+| 搜索 | Gumbel top-k、Sequential Halving 最终选着、completed-Q 改进策略目标、非根访问修正、合法 mask、价值回传 | 访问数平手选着、策略归一化、Q completion 和象棋搜索测试通过 | 修正版搜索训练出的正式模型棋力 |
 | 数据 | 固定 CCPD 来源、许可、解码、合法重放、去重和整盘切分 | 53,685 条输入；27,667 盘去重接受；573 拒绝；全部 SHA-256 复验通过 | 无必需数据项 |
-| 一键训练 | 1 epoch 监督预热、3 × 50K 自博弈、300K replay、20 盘快速评测、best/rollback | 真实 CCPD manifest 上的 CPU tiny 完整闭环和完成后恢复通过 | 正式至少 150,000 个 RL 局面 |
+| 一键训练 | 基础 1 epoch + 3 × 50K；加强 2 epoch + 8 × 100K；300K replay、best/rollback | 真实 CCPD manifest 上的 CPU tiny 完整闭环和完成后恢复通过；加强配置解析与边界测试通过 | 使用修正版搜索完成加强训练并取得被接受的 RL checkpoint |
 | Self-play 性能 | 48 个 spawn actor、共享内存请求槽、单 GPU 动态批推理、滚动调度、压缩 IPC、`runtime.json` | 进程 tiny、批推理、seed/shard 连续与异常保留测试 | RTX 5090 上 5,000 局面 pilot；相对旧基线至少 5 倍才继续 |
 | 恢复与留存 | `playable-run-v2`、v1 备份迁移、原子状态、当前轮或全部 RL 轮次归档重启、bootstrap 恢复、散列复验、安全清理 | 篡改/缺失、v1 迁移、从 bootstrap 重启、候选接受/拒绝、轮换和越界删除测试通过 | 云端中断恢复演练 |
 | 服务 | REST/WebSocket、expected-ply、防过期提交、可取消 AI 搜索、精简模型响应 | API 测试通过；已删除的 `/api/v1/runs` 返回 404 | 长时多会话稳定性 |
@@ -21,10 +21,15 @@
 训练/验证/测试分别为 24,878 / 1,418 / 1,371 盘。这些是数据完整性事实，
 不是棋力结论。
 
-2026-09-03 本地验证快照：Ruff 格式/检查通过，Mypy 对 36 个源文件通过，
-71 个 Python 测试通过，native 另由 Linux CI 执行 10,000 个随机局面差分；前端 3 个组件
-测试、TypeScript、Vite 构建及桌面/窄屏 4 个 Playwright 场景通过；sdist 和 wheel
-构建通过；真实处理后 CCPD 上的 `train playable --tiny` 及 `--resume` 通过。
+2026-09-04 本地验证快照：Ruff 检查通过，Mypy 对 36 个源文件通过，77 个 Python
+测试通过；native 的 10,000 个随机局面差分由 Linux CI 执行。前端 7 个组件/逻辑
+测试、TypeScript、Vite 构建，以及桌面/窄屏共 6 个 Playwright 场景通过；sdist 和
+wheel 构建通过；真实处理后 CCPD 上的修正版 `train playable --tiny` 及完成后
+`--resume` 通过，生成 replay 标记为 `gumbel-completed-q-v2`。
+
+旧搜索云端运行的已知结果是 3 轮合计 153,688 个 RL 局面，三个 candidate 的 arena
+得分率分别为 0.175、0.325、0.325，全部被拒绝；best 因而仍是监督预热模型。该结果
+用于定位旧 raw-visit 搜索目标问题，不能作为修正版搜索或加强配置的棋力结果。
 
 当前没有把 tiny checkpoint 描述为可玩正式模型。只有云端完成至少 150,000 个局面，
 并在最终 Random 20 盘达到至少 80% 得分、零非法着、零引擎崩溃后，才能标记

@@ -47,9 +47,13 @@
 
 ## 自博弈、replay 与恢复
 
-`GumbelSearch` 实现根节点 Gumbel top-k 无放回采样、Sequential Halving、非根
-改进策略、Q-value completion 和交替视角价值回传。产品训练前两轮使用 16 次
-模拟，第三轮使用 32 次；快速模型对局为 64 次；GUI 四档为 8/32/128/256 次。
+`GumbelSearch` 按 [Gumbel AlphaZero](https://openreview.net/pdf?id=bERaNdoegnO)
+实现根节点 Gumbel top-k 无放回采样、Sequential Halving、非根
+改进策略、Q-value completion 和交替视角价值回传。确定性选着使用 Sequential
+Halving 的最终存活动作，而不是访问数平手时的列表顺序；训练策略目标为
+`softmax(logits + (c_visit + max_visit) * c_scale * completed_Q)`。基础产品训练前两轮
+使用 16 次模拟，第三轮使用 32 次；快速模型对局为 64 次；GUI 四档为
+8/32/128/256 次。独立的加强配置使用 8 轮、32–64 次模拟和 128 次 arena 搜索。
 
 自博弈支持按累计 `target_positions` 停止，超出目标不超过一个 actor batch。
 正式配置使用 `spawn` 启动 48 个独立 actor 进程，通过每 actor 一个固定共享内存
@@ -57,7 +61,9 @@
 上限为 1 ms。actor 完成一盘后立即领取新任务，不再受 Python GIL 或固定波次中
 最慢棋局限制。生成与优化仍交替执行，避免争抢单张 5090。
 
-replay 使用压缩状态和稀疏策略，只训练最近 300,000 个局面。每轮拥有独立目录；
+replay 使用压缩状态和稀疏策略，只训练最近 300,000 个局面。replay 元数据包含
+`gumbel-completed-q-v2` 搜索目标版本，旧 raw-visit 目标生成的 shard 会被拒绝。
+每轮拥有独立目录；
 checkpoint 与 `playable-run-v2` 状态完成原子提交后，才会在当前运行目录内清理
 窗口外的旧 replay。状态记录阶段、轮次、种子、局面计数、每个 replay manifest、
 快速评测、运行时参数历史和权重散列。恢复时重新验证所有引用，不覆盖既有 shard。

@@ -3,6 +3,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
+import yaml
 
 torch = pytest.importorskip("torch")
 
@@ -200,6 +201,21 @@ def test_product_training_budget_is_three_times_fifty_thousand() -> None:
     assert config.iterations == 3
     assert config.positions_per_iteration == 50_000
     assert config.simulation_schedule == (16, 16, 32)
+
+
+def test_strength_profile_uses_corrected_search_budget_without_unbounded_replay() -> None:
+    config_path = Path(__file__).parents[2] / "configs" / "stronger.yaml"
+    mapping = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config = playable_config_from_mapping(mapping)
+
+    assert config.bootstrap.epochs == 2
+    assert config.iterations == 8
+    assert config.positions_per_iteration == 100_000
+    assert config.simulation_schedule == (32, 32, 48, 48, 64, 64, 64, 64)
+    assert config.rl.epochs == 2
+    assert config.rl.replay_capacity == 300_000
+    assert config.arena_games == 40
+    assert config.arena_simulations == 128
 
 
 @pytest.mark.torch

@@ -13,6 +13,7 @@ import {
   playMove,
   restartGame,
 } from "./lib/api";
+import { preferredModelId } from "./lib/models";
 import { outcomeReasonLabel, outcomeTitle } from "./lib/outcome";
 import type { Difficulty, GameState, HumanSide, ModelDescriptor } from "./types/api";
 
@@ -84,7 +85,7 @@ export default function App() {
       try {
         const response = await listModels();
         setModels(response.models);
-        const compatible = response.models.find((model) => model.compatible)?.id ?? "heuristic";
+        const compatible = preferredModelId(response.models);
         setModelId(compatible);
         await beginGame({ model: compatible });
       } catch (cause) {

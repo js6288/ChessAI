@@ -1160,3 +1160,213 @@ self-play positions/s、manifest 是否增长、GPU 显存和 CPU 利用率判�
 
 训练流程完成了，但20盘 Random 得分率没有达到80%，或评测发生错误。保留
 `checkpoints/best` 和所有报告；可以先在 GUI 实际试玩，但不要宣称已达到目标棋力。
+
+## 19. 使用修正版搜索重新训练加强模型
+
+如果旧运行的所有 RL candidate 都被拒绝，而且 `checkpoints/best/metadata.json` 仍然
+显示 `training.kind: supervised-bootstrap`，继续给旧运行简单追加轮数并不能解决根因。
+旧实现把根节点访问计数作为训练策略目标，并在小预算访问数打平时按合法着顺序选着；
+修正版改为 completed-Q 改进策略，并使用 Sequential Halving 的最终排名选着。
+
+因此需要开启一个全新的加强运行。旧 `checkpoints/best` 可以继续用于对弈和留档，
+但旧 replay 不得混入新训练，也不要对 `runs/playable` 使用 `--resume`。
+
+### 19.1 更新云端代码并验证环境
+
+先确认旧训练进程已经退出：
+
+```bash
+pgrep -af "chessai train playable" || true
+```
+
+若仍有旧训练进程，只在原训练终端按一次 `Ctrl+C` 并等待退出。然后更新代码：
+
+```bash
+cd /root/autodl-tmp/ChessAI
+source .venv/bin/activate
+
+git status --short
+git pull --ff-only
+uv pip install -e ".[dev,native]"
+
+cmake -S native -B native/build-linux -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DPython_EXECUTABLE="$(which python)"
+cmake --build native/build-linux --config Release
+
+chessai doctor --workspace /root/autodl-tmp/ChessAI
+chessai data validate data/processed/ccpd
+uv run pytest tests/ai/test_search.py tests/ai/test_replay.py -q
+```
+
+`doctor` 必须输出 `ready_for_playable_training: true`。最后一条测试应验证新的
+completed-Q 策略目标和 replay 搜索版本保护。
+
+### 19.2 先运行 5,000 局面性能 pilot
+
+可以使用原监督模型做性能基准；pilot 写入 `artifacts`，不会修改正式运行：
+
+```bash
+chessai benchmark selfplay checkpoints/best \
+  --positions 5000 \
+  --simulations 32 \
+  --actors 48 \
+  --output artifacts/stronger-selfplay-pilot.json
+
+python -m json.tool artifacts/stronger-selfplay-pilot.json
+```
+
+检查 `worker_crashes`、`timeouts`、`illegal_moves`、`nan_count` 和 `inf_count` 均为
+0，48 个 actor 正常存活，并确认 positions/s 持续增长。GPU 利用率不必持续 100%；
+真正的门槛是没有错误、动态 batch 正常形成且局面吞吐稳定。
+
+### 19.3 启动独立加强训练
+
+加强配置的固定预算为：
+
+- 监督预热 2 epoch；
+- 8 轮强化学习，每轮至少 100,000 个新局面，总计至少 800,000；
+- simulations 依次为 `32, 32, 48, 48, 64, 64, 64, 64`；
+- 每轮使用最近最多 300,000 个 replay 局面训练 2 epoch；
+- 每轮 arena 40 盘、128 simulations；
+- 最终 Random 门禁 40 盘、128 simulations。
+
+使用新的输出目录和模型目录：
+
+```bash
+cd /root/autodl-tmp/ChessAI
+source .venv/bin/activate
+mkdir -p runs
+
+chessai train playable data/processed/ccpd \
+  --output runs/stronger-v2 \
+  --model-dir checkpoints-stronger \
+  --config configs/stronger.yaml \
+  2>&1 | tee runs/stronger-v2-console.log
+```
+
+首次启动不要加 `--resume`。SSH 断开或手动中断后，使用完全相同的配置恢复：
+
+```bash
+chessai train playable data/processed/ccpd \
+  --output runs/stronger-v2 \
+  --model-dir checkpoints-stronger \
+  --config configs/stronger.yaml \
+  --resume \
+  2>&1 | tee -a runs/stronger-v2-console.log
+```
+
+### 19.4 观察训练进度和判断是否真正变强
+
+另开一个 SSH 终端查看总状态：
+
+```bash
+cd /root/autodl-tmp/ChessAI
+python - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("runs/stronger-v2/state.json")
+state = json.loads(path.read_text(encoding="utf-8"))
+print("stage:", state["stage"])
+print("iteration:", state["iteration"], "/", state["config"]["iterations"])
+print("RL positions:", state["rl_generated_positions"])
+print("active checkpoint:", state["active_checkpoint"])
+print("playable gate:", state["playable_gate_passed"])
+print("evaluations:")
+for item in state["evaluations"]:
+    summary = item["summary"]
+    print(
+        "  iteration", item["iteration"],
+        "accepted=", item["accepted"],
+        "W/D/L=", summary.get("wins"), summary.get("draws"), summary.get("losses"),
+        "score=", summary.get("score_rate"),
+    )
+PY
+```
+
+self-play 阶段查看当前轮实时吞吐：
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+state = json.loads(Path("runs/stronger-v2/state.json").read_text(encoding="utf-8"))
+iteration = int(state["iteration"]) + 1
+root = Path("runs/stronger-v2") / f"iteration-{iteration:03d}" / "selfplay"
+for name in ("runtime.json", "manifest.json"):
+    path = root / name
+    if not path.is_file():
+        print(name, "尚未生成")
+        continue
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    print(name)
+    print("  games:", payload.get("games", payload.get("completed_games")))
+    print("  positions:", payload.get("positions", payload.get("completed_positions")))
+    print("  positions/s:", payload.get("positions_per_second"))
+    print("  inference:", payload.get("inference"))
+PY
+```
+
+判断模型是否训练好，优先看棋力证据而不是 loss：
+
+1. `evaluations` 中开始出现 `accepted: true`，并且 `active_checkpoint` 散列发生变化；
+2. `checkpoints-stronger/best/metadata.json` 的 `training.kind` 不再是
+   `supervised-bootstrap`，而是 RL candidate 对应的训练记录；
+3. 多轮 arena 得分率能维持在 0.50 以上，而不是偶然只通过一次；
+4. 最终 `playable_gate_passed` 为 true，且报告中零非法着、零引擎崩溃；
+5. 下载后再以相同 GUI 难度和固定开局与旧模型直接对弈。Random 门禁只证明基础
+   可玩性，不等于达到《天天象棋》业余段位。
+
+如果前 2 轮仍然全部被大比分拒绝（例如得分率长期低于 0.40），先停止训练并保留
+日志、arena 报告和 checkpoint 排查，不建议盲目烧完 8 轮。
+
+### 19.5 导出并下载加强模型
+
+训练完成后导出新的 best；不要误导出旧 `checkpoints/best`：
+
+```bash
+chessai export \
+  checkpoints-stronger/best \
+  artifacts/chessai-stronger-v2 \
+  --data-manifest data/processed/ccpd/manifest.json \
+  --evaluation-report runs/stronger-v2/final-evaluation.json
+
+tar -czf artifacts/chessai-stronger-v2.tar.gz \
+  -C artifacts chessai-stronger-v2
+sha256sum artifacts/chessai-stronger-v2.tar.gz \
+  | tee artifacts/chessai-stronger-v2.tar.gz.sha256
+```
+
+将 `artifacts/chessai-stronger-v2.tar.gz` 和对应 `.sha256` 下载到 Windows：
+
+```powershell
+Set-Location E:\AI_project\ChessAI
+New-Item -ItemType Directory -Force .\artifacts\cloud-download | Out-Null
+
+scp -P SSH端口 `
+  云端用户名@云端地址:/root/autodl-tmp/ChessAI/artifacts/chessai-stronger-v2.tar.gz `
+  .\artifacts\cloud-download\
+scp -P SSH端口 `
+  云端用户名@云端地址:/root/autodl-tmp/ChessAI/artifacts/chessai-stronger-v2.tar.gz.sha256 `
+  .\artifacts\cloud-download\
+```
+
+校验、安装并启动 GUI：
+
+```powershell
+Get-FileHash -Algorithm SHA256 `
+  .\artifacts\cloud-download\chessai-stronger-v2.tar.gz
+Get-Content `
+  .\artifacts\cloud-download\chessai-stronger-v2.tar.gz.sha256
+
+tar -xzf .\artifacts\cloud-download\chessai-stronger-v2.tar.gz `
+  -C .\checkpoints
+
+$env:CHESSAI_MODEL_DIR = "E:\AI_project\ChessAI\checkpoints"
+uv run chessai serve --host 127.0.0.1 --port 8000
+```
+
+GUI 会优先选择首个兼容的策略价值 checkpoint；如果本地同时存在多个模型，仍应在
+“对弈模型”下拉框中确认选择的是 `chessai-stronger-v2`。
