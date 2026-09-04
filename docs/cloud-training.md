@@ -1216,7 +1216,7 @@ chessai benchmark selfplay checkpoints/best \
 python -m json.tool artifacts/stronger-selfplay-pilot.json
 ```
 
-检查 `worker_crashes`、`timeouts`、`illegal_moves`、`nan_count` 和 `inf_count` 均为
+检查 `failures` 下的 `worker_crashes`、`timeouts`、`illegal_moves` 和 `nan_or_inf` 均为
 0，48 个 actor 正常存活，并确认 positions/s 持续增长。GPU 利用率不必持续 100%；
 真正的门槛是没有错误、动态 batch 正常形成且局面吞吐稳定。
 
